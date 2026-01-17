@@ -310,6 +310,15 @@ class Stage:
         self.orion_scheduler = None
         if USE_ORION_SCHEDULER and ORION_AVAILABLE:
             try:
+                # 【修复】在启动调度器之前，先初始化 CUDA 上下文
+                # 这样可以确保调度器线程和 PyTorch 主线程使用相同的 CUDA 上下文
+                if self.device.type == 'cuda':
+                    # 显式初始化 CUDA 上下文
+                    torch.cuda.init()
+                    # 执行一个简单的 CUDA 操作来确保上下文已创建
+                    torch.cuda.synchronize()
+                    print(f"[Orion] Stage {ID}: CUDA context initialized before scheduler start")
+                
                 # 获取 Orion 调度器单例
                 self.orion_scheduler = get_scheduler()
                 # 设置为多优先级调度模式
