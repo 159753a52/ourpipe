@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# PyTorch
+*.pth
+*.pt
+
+# Logs
+*.log
+*.out
+*.err
+ourgpipe/logs/
+*.trace.json
+
+# Profiler traces
+profiler_*/
+profiler_*/rank*/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Large files
+*.sif
+*.tar
+*.tar.gz
+*.zip
+*.bz2
+
+# Workspace
+workspace/
+
+# Singularity
+.singularity/
+
+# Claude
+.claude/
+
+# Git submodules (kernel_intercept has its own git)
+kernel_intercept/.git/
