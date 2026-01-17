@@ -4,8 +4,17 @@
 
 在启用 Orion 调度器运行 GPipe 训练时，第一次迭代的前向传播阶段发生 CUDA 错误：
 
+### 第一次测试结果
 ```
 RuntimeError: CUDA error: CUBLAS_STATUS_NOT_INITIALIZED when calling cublasSgemm
+RuntimeError: CUDA error: an illegal memory access was encountered
+```
+
+### 第二次测试结果（最新）
+```
+UserWarning: Attempting to run cuBLAS, but there was no current CUDA context!
+RuntimeError: CUDA error: CUBLAS_STATUS_NOT_INITIALIZED when calling cublasCreate(handle)
+RuntimeError: CUDA error: CUBLAS_STATUS_ALLOC_FAILED when calling cublasCreate(handle)
 RuntimeError: CUDA error: an illegal memory access was encountered
 ```
 
@@ -221,8 +230,65 @@ if (!handle) {
 - ❌ 仍然出现 `CUBLAS_STATUS_NOT_INITIALIZED` 错误
 - ❌ 仍然出现 `illegal memory access` 错误
 
-### 第二次测试（待进行）
-需要重新编译并测试修改后的代码。
+### 第二次测试结果（最新）
+
+**测试环境：**
+- 4 个 GPU 进程（rank 0-3）
+- 每个进程使用不同的 GPU（cuda:0, cuda:1, cuda:2, cuda:3）
+- 启用 Orion 调度器（4 个客户端）
+
+**测试过程：**
+1. ✅ 所有 4 个进程成功启动
+2. ✅ 所有 4 个进程成功初始化 Orion 调度器
+3. ✅ 调度器线程成功启动并初始化 CUDA 上下文
+4. ✅ cuBLAS 拦截成功，拦截了多个 cuBLAS 操作
+5. ❌ 在第一次迭代的前向传播阶段出现错误
+
+**关键错误信息：**
+
+1. **PyTorch 警告：**
+```
+UserWarning: Attempting to run cuBLAS, but there was no current CUDA context!
+Attempted to set the primary context...
+(Triggered internally at /home/bingxing2/home/scx6001/lvzy/2.4.0/pytorch/aten/src/ATen/cuda/CublasHandlePool.cpp:135.)
+```
+
+2. **cuBLAS 创建错误：**
+```
+RuntimeError: CUDA error: CUBLAS_STATUS_NOT_INITIALIZED when calling cublasCreate(handle)
+RuntimeError: CUDA error: CUBLAS_STATUS_ALLOC_FAILED when calling cublasCreate(handle)
+```
+
+3. **非法内存访问：**
+```
+RuntimeError: CUDA error: an illegal memory access was encountered
+```
+
+**分析：**
+
+第二次测试的错误比第一次更严重：
+
+1. **PyTorch 警告表明：** PyTorch 在尝试使用 cuBLAS 时发现没有当前 CUDA 上下文，这意味着我们的 CUDA 上下文初始化方法可能不正确。
+
+2. **cuBLAS 创建错误：** 现在错误发生在 `cublasCreate(handle)` 时，而不是在使用 cuBLAS 操作时。这表明 PyTorch 的 cuBLAS handle 池在尝试创建新的 handle 时失败了。
+
+3. **调度器线程使用 GPU 0：** 从日志中可以看到，所有 4 个进程的调度器线程都使用 GPU 0：
+   ```
+   [ORION][orion::LogLevel::INFO] Scheduler thread: Using CUDA device 0
+   ```
+   但每个进程的主线程使用不同的 GPU（cuda:0, cuda:1, cuda:2, cuda:3）。这可能导致 CUDA 上下文冲突。
+
+4. **多个线程同时创建 cuBLAS handle：** 从错误堆栈可以看到，多个线程（Thread-3, Thread-4, Thread-5, Thread-6）同时尝试创建 cuBLAS handle，这可能导致竞争条件。
+
+**结论：**
+
+第二次测试表明问题比第一次更严重。核心问题可能是：
+
+1. **调度器线程使用错误的 GPU：** 调度器线程应该使用与主线程相同的 GPU，而不是固定使用 GPU 0。
+
+2. **PyTorch 的 cuBLAS handle 池与 Orion 的拦截机制冲突：** PyTorch 内部的 cuBLAS handle 管理机制可能与 Orion 的拦截和线程本地 handle 创建机制冲突。
+
+3. **多线程同时创建 cuBLAS handle：** 多个线程同时创建 cuBLAS handle 可能导致竞争条件和资源冲突。
 
 ## 可能的进一步问题
 
