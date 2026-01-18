@@ -313,11 +313,15 @@ class Stage:
                 # 【修复】在启动调度器之前，先初始化 CUDA 上下文
                 # 这样可以确保调度器线程和 PyTorch 主线程使用相同的 CUDA 上下文
                 if self.device.type == 'cuda':
-                    # 显式初始化 CUDA 上下文
+                    # 【关键修复】先设置当前设备为本 rank 对应的 GPU
+                    # 这确保 CUDA 上下文在正确的设备上初始化
+                    # cuBLAS handle 会绑定到当前设备，必须在正确的 device 上创建
+                    torch.cuda.set_device(self.device)
+                    # 显式初始化 CUDA 上下文（现在会在正确的设备上）
                     torch.cuda.init()
                     # 执行一个简单的 CUDA 操作来确保上下文已创建
                     torch.cuda.synchronize()
-                    print(f"[Orion] Stage {ID}: CUDA context initialized before scheduler start")
+                    print(f"[Orion] Stage {ID}: CUDA context initialized on device={self.device} before scheduler start")
                 
                 # 获取 Orion 调度器单例
                 self.orion_scheduler = get_scheduler()
@@ -325,8 +329,10 @@ class Stage:
                 self.orion_scheduler.set_scheduling_mode(SchedulingMode.MULTI_PRIORITY)
                 # 启动调度器（如果尚未启动）
                 if not self.orion_scheduler.is_running():
-                    self.orion_scheduler.start(num_clients=num_microbatches)
-                print(f"[Orion] Stage {ID}: Orion scheduler initialized with {num_microbatches} clients (multi-priority mode)")
+                    # 获取当前 GPU ID
+                    device_id = self.device.index if self.device.type == 'cuda' else 0
+                    self.orion_scheduler.start(num_clients=num_microbatches, device_id=device_id)
+                print(f"[Orion] Stage {ID}: Orion scheduler initialized with {num_microbatches} clients (multi-priority mode, device={device_id})")
             except Exception as e:
                 print(f"[Orion] Stage {ID}: Failed to initialize Orion scheduler: {e}")
                 self.orion_scheduler = None
@@ -764,11 +770,24 @@ for epoch in range(epochs):
                 """
                 单个 micro-batch 的前向计算
                 在独立的 CUDA 流中执行，实现计算并行
-                
+
                 【Orion 集成】：
                 - 设置 client_idx = mb_idx，使得 micro-batch 0 具有最高优先级
                 - Orion 调度器会确保低优先级的 kernel 等待高优先级队列清空
+
+                【修复】在函数开头显式绑定 CUDA context 并初始化 CUBLAS handle
                 """
+                # 【修复】在函数开头显式绑定 CUDA context 并初始化 CUBLAS
+                if my_stage.device.type == 'cuda':
+                    torch.cuda.set_device(my_stage.device)
+                    # 【关键修复】触发一个 CUBLAS 操作来初始化线程本地的 CUBLAS handle
+                    # 这会在线程的 CUDA 上下文中创建必要的 CUBLAS 状态
+                    _ = torch.nn.functional.linear(
+                        torch.zeros(1, 10, device=my_stage.device),
+                        torch.zeros(10, 10, device=my_stage.device)
+                    )
+                    torch.cuda.synchronize()
+                
                 # 【Orion】设置当前线程的 client index（用于多优先级调度）
                 if my_stage.orion_scheduler is not None:
                     my_stage.orion_scheduler.set_client_idx(mb_idx)
@@ -825,11 +844,23 @@ for epoch in range(epochs):
                 """
                 单个 micro-batch 的反向计算
                 在独立的 CUDA 流中执行，实现计算并行
-                
+
                 【Orion 集成】：
                 - 设置 client_idx = mb_idx，保持与前向传播相同的优先级
                 - 反向传播时，micro-batch 0 仍然具有最高优先级
+
+                【修复】在函数开头显式绑定 CUDA context 并初始化 CUBLAS handle
                 """
+                # 【修复】在函数开头显式绑定 CUDA context 并初始化 CUBLAS
+                if my_stage.device.type == 'cuda':
+                    torch.cuda.set_device(my_stage.device)
+                    # 【关键修复】触发一个 CUBLAS 操作来初始化线程本地的 CUBLAS handle
+                    _ = torch.nn.functional.linear(
+                        torch.zeros(1, 10, device=my_stage.device),
+                        torch.zeros(10, 10, device=my_stage.device)
+                    )
+                    torch.cuda.synchronize()
+                
                 # 【Orion】设置当前线程的 client index（用于多优先级调度）
                 if my_stage.orion_scheduler is not None:
                     my_stage.orion_scheduler.set_client_idx(mb_idx)

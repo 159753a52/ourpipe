@@ -65,7 +65,12 @@ def merge_chrome_traces(input_dir, output_file):
 
 # 使用方法
 if __name__ == "__main__":
-    input_directory = "./profiler_thread-stream_4096"
-    output_file = "./profiler_thread-stream_4096/thread-stream_4096_trace.json"
-    
+    # 合并 Orion 调度器的 profiler 文件
+    input_directory = "./profiler_orion"
+    output_file = "./profiler_orion/merged_orion_trace.json"
+
+    # 合并 baseline 的 profiler 文件
+    # input_directory = "./profiler_baseline"
+    # output_file = "./profiler_baseline/merged_baseline_trace.json"
+
     merge_chrome_traces(input_directory, output_file)
