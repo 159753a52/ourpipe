@@ -55,6 +55,7 @@ import random
 import numpy as np
 import gc  # 垃圾回收
 import threading  # 多线程支持，用于并行提交计算任务
+import queue  # 线程安全队列，用于计算和通信线程之间的通知
 
 import sys
 # 从 GPT.py 导入所有定义，包括 Block（Transformer块）、tok（分词器）、process（数据处理函数）、datasets 等
@@ -85,17 +86,27 @@ else:
 # ==================== 超参数配置 ====================
 
 # 模型架构参数
-emb_size = 4096       # 嵌入维度大小（词向量维度）
-head_size = 128       # 注意力头的维度
-n_layer = 16          # Transformer 层数
-sequence_len = 128    # 序列长度（每个样本的 token 数量）
+# emb_size = 4096       # 嵌入维度大小（词向量维度）
+# head_size = 128       # 注意力头的维度
+# n_layer = 16          # Transformer 层数
+# sequence_len = 128    # 序列长度（每个样本的 token 数量）
 
-# 训练参数
-learning_rate = 1e-4  # 学习率
-eval_iters = 20       # 评估迭代次数
-batch_size = 32       # 批次大小
-epochs = 2            # 训练轮数
+# # 训练参数
+# learning_rate = 1e-4  # 学习率
+# eval_iters = 20       # 评估迭代次数
+# batch_size = 32       # 批次大小
+# epochs = 2            # 训练轮数
 num_microbatches = 4  # 微批次数量（GPipe 的核心参数，将一个 batch 分成多个 micro-batch）
+
+emb_size = 512
+head_size = 32
+# The n_layer of GPT-3.35B should be 16
+n_layer = 16
+sequence_len = 128
+learning_rate = 1e-4
+eval_iters = 20
+batch_size = 64
+epochs = 2
 
 # FFN 低秩分解参数（用于减少 FFN 层的参数量）
 ff_low_rank = emb_size // 2
@@ -305,6 +316,15 @@ class Stage:
         else:
             self.comp_streams = None
             self.comm_stream = None
+
+        # ==================== 通信线程相关初始化 ====================
+        # 用于"计算完成即发送"的优化机制
+        # - ready_queue: 线程安全队列，计算线程通过它通知通信线程某个 microbatch 已 ready
+        # - ready_events: CUDA Event 列表，每个 microbatch 一个，用于 GPU 层面的依赖管理
+        # - ready_flags: CPU 端的 book-keeping，标记哪些 microbatch 已 ready
+        self.ready_queue = queue.Queue() if self.device.type == 'cuda' else None
+        self.ready_events = [None] * num_microbatches
+        self.ready_flags = [False] * num_microbatches
 
         # ==================== Orion 调度器初始化 ====================
         self.orion_scheduler = None
@@ -764,6 +784,57 @@ for epoch in range(epochs):
                         handle = my_stage.forward_irecv(mb_idx, i)
                         fwd_recv_handles[mb_idx] = handle
 
+            # --- 步骤 1.5：初始化"计算完成即发送"机制 ---
+            # 重置 ready_flags 和 ready_events
+            my_stage.ready_flags = [False] * num_microbatches
+            my_stage.ready_events = [None] * num_microbatches
+
+            # 定义通信线程：按 mb_idx 顺序发送（适配 NCCL "顺序匹配"规则）
+            def comm_worker():
+                """
+                通信线程：负责按顺序发送已完成的 microbatch
+
+                工作原理：
+                1. 从 ready_queue 阻塞等待获取已完成的 mb_idx
+                2. 维护 pending 集合和 next_to_send 指针
+                3. 只要"下一个应该发送的 microbatch"已经 ready，就连续发送
+                4. 每个发送前等待对应的 CUDA Event（确保计算真正完成）
+
+                这样实现了：哪个 microbatch 先算完，就尽快把它发出去
+                """
+                # 【重要】在通信线程中设置正确的 CUDA device
+                # CUDA 的"当前 device"是线程局部的，必须显式设置
+                if my_stage.device.type == "cuda":
+                    torch.cuda.set_device(my_stage.device)
+
+                next_to_send = 0
+                pending = set()
+
+                while next_to_send < num_microbatches:
+                    mb = my_stage.ready_queue.get()  # 阻塞直到有 micro ready
+                    pending.add(mb)
+
+                    # 只要"下一个应该发送的 micro"已经 ready，就连续发送
+                    while next_to_send in pending:
+                        pending.remove(next_to_send)
+
+                        if current_stage < model_parallel_size:
+                            with torch.cuda.stream(my_stage.comm_stream):
+                                with record_function(f"Fwd Send mb_{next_to_send}"):
+                                    # 等待该 micro 的计算流真正完成（GPU 依赖，不阻塞 CPU）
+                                    ev = my_stage.ready_events[next_to_send]
+                                    my_stage.comm_stream.wait_event(ev)
+
+                                    # 现在可以安全 enqueue isend
+                                    h = my_stage.forward_isend(my_stage.fwd_cache[next_to_send], next_to_send, i)
+                                    fwd_send_handles[next_to_send] = h
+
+                        next_to_send += 1
+
+            # 启动通信线程
+            comm_t = threading.Thread(target=comm_worker)
+            comm_t.start()
+
             # --- 步骤 2：使用多线程并行提交 Compute 到不同 streams ---
             # 定义前向计算函数，每个 micro-batch 在独立的线程中执行
             def fwd_compute_mb(mb_idx):
@@ -775,36 +846,49 @@ for epoch in range(epochs):
                 - 设置 client_idx = mb_idx，使得 micro-batch 0 具有最高优先级
                 - Orion 调度器会确保低优先级的 kernel 等待高优先级队列清空
 
-                【修复】在函数开头显式绑定 CUDA context 并初始化 CUBLAS handle
+                【优化】计算完成后立即通知通信线程：
+                1. 在计算流上记录 CUDA Event
+                2. 将 mb_idx 放入 ready_queue 通知通信线程
                 """
-                # 【修复】在函数开头显式绑定 CUDA context 并初始化 CUBLAS
+                # 【修复】在函数开头显式绑定 CUDA context 并初始化 CUBLAS handle
                 if my_stage.device.type == 'cuda':
                     torch.cuda.set_device(my_stage.device)
-                    # 【关键修复】触发一个 CUBLAS 操作来初始化线程本地的 CUBLAS handle
+                    # 【关键】触发一个轻量的 CUDA 操作来初始化线程本地的 CUBLAS handle
                     # 这会在线程的 CUDA 上下文中创建必要的 CUBLAS 状态
+                    # 【重要】不使用 synchronize()，避免阻塞整个 device
                     _ = torch.nn.functional.linear(
                         torch.zeros(1, 10, device=my_stage.device),
                         torch.zeros(10, 10, device=my_stage.device)
                     )
-                    torch.cuda.synchronize()
-                
+
                 # 【Orion】设置当前线程的 client index（用于多优先级调度）
                 if my_stage.orion_scheduler is not None:
                     my_stage.orion_scheduler.set_client_idx(mb_idx)
-                
+
                 current_comp_stream = my_stage.comp_streams[mb_idx]
                 with torch.cuda.stream(current_comp_stream):
                     with record_function(f"Fwd Compute mb_{mb_idx}"):
                         if current_stage > 1:
                             # 非第一阶段：等待接收完成，然后使用接收到的数据
                             fwd_recv_handles[mb_idx].wait()
-                            input_tensor = my_stage.out_x_buffers[mb_idx].to(DEVICE)
+                            # 【优化】buffer 本来就在 device 上，不需要 .to(DEVICE)
+                            input_tensor = my_stage.out_x_buffers[mb_idx]
                         else:
                             # 第一阶段：直接使用输入数据
                             input_tensor = micro_inputs[mb_idx]
-                        
+
                         # 调用修改后的 forward，传入 mb_idx 以便线程安全地写入缓存
                         output_tensor = my_stage.forward(input_tensor, mb_idx)
+
+                        # 【优化】在计算流上记录 CUDA Event
+                        # 这标志着该 microbatch 的计算已完成
+                        ev = torch.cuda.Event()
+                        ev.record(current_comp_stream)
+                        my_stage.ready_events[mb_idx] = ev
+
+                # 【优化】通知通信线程：这个 microbatch 已经 ready
+                # 通信线程会在收到通知后，按顺序将其发送
+                my_stage.ready_queue.put(mb_idx)
 
             # 创建并启动所有前向计算线程
             fwd_threads = []
@@ -812,22 +896,14 @@ for epoch in range(epochs):
                 t = threading.Thread(target=fwd_compute_mb, args=(mb_idx,))
                 t.start()
                 fwd_threads.append(t)
-            
+
             # 等待所有 forward compute 线程完成（确保所有 kernel 已 enqueue）
             for t in fwd_threads:
                 t.join()
 
-            # --- 步骤 3：串行提交 Send（使用共享 comm_stream，避免并发访问）---
-            for mb_idx in range(num_microbatches):
-                if current_stage < model_parallel_size:
-                    current_comp_stream = my_stage.comp_streams[mb_idx]
-                    with record_function(f"Fwd Send mb_{mb_idx}"):
-                        with torch.cuda.stream(my_stage.comm_stream):
-                            # 等待计算流完成
-                            my_stage.comm_stream.wait_stream(current_comp_stream)
-                            # 发送前向传播的输出
-                            handle = my_stage.forward_isend(my_stage.fwd_cache[mb_idx], mb_idx, i)
-                            fwd_send_handles[mb_idx] = handle
+            # --- 步骤 3：等待通信线程完成所有发送 ---
+            # 通信线程会在收到所有 microbatch 的 ready 通知后自动退出
+            comm_t.join()
 
             # ==================== 反向传播阶段 ====================
             # 使用无死锁的通信模型
@@ -851,20 +927,21 @@ for epoch in range(epochs):
 
                 【修复】在函数开头显式绑定 CUDA context 并初始化 CUBLAS handle
                 """
-                # 【修复】在函数开头显式绑定 CUDA context 并初始化 CUBLAS
+                # 【修复】在函数开头显式绑定 CUDA context 并初始化 CUBLAS handle
                 if my_stage.device.type == 'cuda':
                     torch.cuda.set_device(my_stage.device)
-                    # 【关键修复】触发一个 CUBLAS 操作来初始化线程本地的 CUBLAS handle
+                    # 【关键】触发一个轻量的 CUDA 操作来初始化线程本地的 CUBLAS handle
+                    # 这会在线程的 CUDA 上下文中创建必要的 CUBLAS 状态
+                    # 【重要】不使用 synchronize()，避免阻塞整个 device
                     _ = torch.nn.functional.linear(
                         torch.zeros(1, 10, device=my_stage.device),
                         torch.zeros(10, 10, device=my_stage.device)
                     )
-                    torch.cuda.synchronize()
-                
+
                 # 【Orion】设置当前线程的 client index（用于多优先级调度）
                 if my_stage.orion_scheduler is not None:
                     my_stage.orion_scheduler.set_client_idx(mb_idx)
-                
+
                 current_comp_stream = my_stage.comp_streams[mb_idx]
                 with torch.cuda.stream(current_comp_stream):
                     with record_function(f"Bwd Compute mb_{mb_idx}"):
@@ -872,8 +949,9 @@ for epoch in range(epochs):
                         if current_stage < model_parallel_size:
                             # 非最后阶段：等待接收梯度
                             bwd_recv_handles[mb_idx].wait()
-                            grad_tensor = my_stage.grad_y_buffers[mb_idx].to(DEVICE)
-                        
+                            # 【优化】buffer 本来就在 device 上，不需要 .to(DEVICE)
+                            grad_tensor = my_stage.grad_y_buffers[mb_idx]
+
                         if current_stage == model_parallel_size:
                             # 最后阶段：计算损失并反向传播
                             logits = my_stage.fwd_cache[mb_idx].transpose(-2, -1)
