@@ -36,4 +36,5 @@ training:
 parallel:
   model_parallel_size: 8  # 8 个流水线 stage（2节点 x 4卡）
   data_parallel_size: 1   # 纯流水线并行，无数据并行
+  scheduler: async_threaded  # 使用异步多线程调度器
   use_orion_scheduler: false

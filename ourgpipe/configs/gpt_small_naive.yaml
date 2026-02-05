@@ -1,5 +1,5 @@
-# GPT Small 配置 - 启用 Orion 调度器
-# 用于测试 Orion 多优先级调度
+# GPT Small 配置 - 使用 Naive 同步调度器
+# 适合调试和基准测试
 
 model:
   name: gpt
@@ -7,7 +7,7 @@ model:
   num_layers: 16
   num_heads: 16
   sequence_length: 128
-  vocab_size: -1
+  vocab_size: -1  # 从数据集获取
   extra:
     head_size: 32
     ff_low_rank: null
@@ -24,12 +24,12 @@ training:
   epochs: 2
   num_microbatches: 4
   gradient_accumulation: 1
-  max_iterations: -1
-  profile_iteration: 100
+  max_iterations: -1 
+  profile_iteration: 20 
   exit_after_profile: true
 
 parallel:
   model_parallel_size: 4
   data_parallel_size: 1
-  scheduler: async_threaded  # Orion 调度器配合异步多线程调度
-  use_orion_scheduler: true
+  scheduler: naive  # 使用 Naive 同步调度器
+  use_orion_scheduler: false

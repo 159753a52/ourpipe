@@ -8,6 +8,7 @@ from .interfaces import ModelInterface, StageInterface, DatasetInterface
 from .config import PipelineConfig, ModelConfig, DatasetConfig, TrainingConfig, ParallelConfig
 from .registry import MODEL_REGISTRY, DATASET_REGISTRY, STAGE_REGISTRY
 from .stage import BaseStage
+from .schedulers import BaseScheduler, SCHEDULER_REGISTRY, NaiveScheduler, AsyncThreadedScheduler
 
 __all__ = [
     # 接口
@@ -24,6 +25,11 @@ __all__ = [
     'MODEL_REGISTRY',
     'DATASET_REGISTRY',
     'STAGE_REGISTRY',
+    'SCHEDULER_REGISTRY',
     # 基类
     'BaseStage',
+    'BaseScheduler',
+    # 调度器
+    'NaiveScheduler',
+    'AsyncThreadedScheduler',
 ]

@@ -84,10 +84,12 @@ class ParallelConfig:
     Attributes:
         model_parallel_size: 流水线阶段数（模型并行大小）
         data_parallel_size: 数据并行副本数
+        scheduler: 调度器类型，可选 'naive' 或 'async_threaded'
         use_orion_scheduler: 是否使用 Orion 多优先级调度器
     """
     model_parallel_size: int = 4
     data_parallel_size: int = 1
+    scheduler: str = "async_threaded"  # 'naive' 或 'async_threaded'
     use_orion_scheduler: bool = False
 
 
@@ -236,6 +238,11 @@ class PipelineConfig:
         if self.parallel.data_parallel_size <= 0:
             raise ValueError("data_parallel_size must be positive")
         
+        # 验证调度器类型
+        valid_schedulers = ['naive', 'async_threaded']
+        if self.parallel.scheduler not in valid_schedulers:
+            raise ValueError(f"scheduler must be one of {valid_schedulers}, got '{self.parallel.scheduler}'")
+        
         return True
     
     def __repr__(self) -> str:
@@ -244,6 +251,6 @@ class PipelineConfig:
             f"  model={self.model.name}(hidden={self.model.hidden_size}, layers={self.model.num_layers}),\n"
             f"  dataset={self.dataset.name}(batch={self.dataset.batch_size}),\n"
             f"  training(lr={self.training.learning_rate}, epochs={self.training.epochs}, microbatches={self.training.num_microbatches}),\n"
-            f"  parallel(mp={self.parallel.model_parallel_size}, dp={self.parallel.data_parallel_size}, orion={self.parallel.use_orion_scheduler})\n"
+            f"  parallel(mp={self.parallel.model_parallel_size}, dp={self.parallel.data_parallel_size}, scheduler={self.parallel.scheduler}, orion={self.parallel.use_orion_scheduler})\n"
             f")"
         )

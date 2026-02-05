@@ -30,4 +30,5 @@ training:
 parallel:
   model_parallel_size: 4
   data_parallel_size: 1
+  scheduler: async_threaded  # 使用异步多线程调度器（高性能）
   use_orion_scheduler: false

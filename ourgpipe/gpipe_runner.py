@@ -5,8 +5,12 @@ GPipe 流水线并行训练 - 模型无关的主入口
 使用方法:
     source /home/bingxing2/home/scx9kvs/mxy/env.sh
     conda activate pai-megatron
-    # 基本运行
+    
+    # 使用异步多线程调度器（默认，高性能）
     torchrun --nproc_per_node=4 --master_port=29500 gpipe_runner.py --config configs/gpt_small.yaml
+    
+    # 使用 Naive 同步调度器（简单，适合调试）
+    torchrun --nproc_per_node=4 --master_port=29500 gpipe_runner.py --config configs/gpt_small_naive.yaml
     
     # 启用 Orion 调度器
     export USE_ORION_SCHEDULER=1
@@ -21,25 +25,22 @@ import torch
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
-import torch.nn as nn
 import torch.distributed as dist
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import DataLoader
 import torch.profiler
-from torch.profiler import record_function
 
 import argparse
 import datetime
-import time
 import os
 import sys
-import threading
 import contextlib
 from tqdm import tqdm
 
 # 导入核心框架
 from core.config import PipelineConfig
 from core.registry import MODEL_REGISTRY, DATASET_REGISTRY, STAGE_REGISTRY
+from core.schedulers import SCHEDULER_REGISTRY
 
 # 导入模型实现（触发注册）
 import models
@@ -97,186 +98,41 @@ def setup_parallel_groups(world_size: int, model_parallel_size: int):
     return model_parallel_groups, data_parallel_groups
 
 
-def train_iteration(
-    my_stage,
-    micro_inputs,
-    micro_labels,
-    iteration: int,
-    config: PipelineConfig,
-    current_stage: int,
-    model_parallel_size: int,
-    num_microbatches: int
-):
-    """执行一次训练迭代
-    
-    Args:
-        my_stage: 当前阶段对象
-        micro_inputs: micro-batch 输入列表
-        micro_labels: micro-batch 标签列表
-        iteration: 当前迭代编号
-        config: 流水线配置
-        current_stage: 当前阶段 ID
-        model_parallel_size: 模型并行大小
-        num_microbatches: micro-batch 数量
-    """
-    import torch.nn.functional as F
-    
-    # 通信句柄字典
-    fwd_recv_handles = {}
-    fwd_send_handles = {}
-    bwd_recv_handles = {}
-    bwd_send_handles = {}
-    
-    # 重置缓存
-    my_stage.reset_cache()
-    
-    # ==================== 前向传播 ====================
-    
-    # 步骤 1：所有接收方提交 irecv
-    if current_stage > 1:
-        for mb_idx in range(num_microbatches):
-            with record_function(f"Fwd Post Irecv mb_{mb_idx}"):
-                handle = my_stage.forward_irecv(mb_idx, iteration)
-                fwd_recv_handles[mb_idx] = handle
-    
-    # 步骤 2：多线程并行计算
-    def fwd_compute_mb(mb_idx):
-        torch.cuda.set_device(my_stage.device)
-        
-        # Orion 调度器设置
-        if my_stage.orion_scheduler is not None:
-            my_stage.orion_scheduler.set_client_idx(mb_idx)
-        
-        current_comp_stream = my_stage.comp_streams[mb_idx]
-        
-        with torch.cuda.stream(current_comp_stream):
-            with record_function(f"Fwd Compute mb_{mb_idx}"):
-                if current_stage > 1:
-                    fwd_recv_handles[mb_idx].wait()
-                    input_tensor = my_stage.out_x_buffers[mb_idx]
-                else:
-                    input_tensor = micro_inputs[mb_idx]
-                
-                output_tensor = my_stage.forward(input_tensor, mb_idx)
-        
-        # 发送
-        if current_stage < model_parallel_size:
-            with my_stage.comm_stream_lock:
-                with torch.cuda.stream(my_stage.comm_stream):
-                    my_stage.comm_stream.wait_stream(current_comp_stream)
-                    with record_function(f"Fwd Send mb_{mb_idx}"):
-                        handle = my_stage.forward_isend(my_stage.fwd_cache[mb_idx], mb_idx, iteration)
-                        fwd_send_handles[mb_idx] = handle
-    
-    fwd_threads = []
-    for mb_idx in range(num_microbatches):
-        t = threading.Thread(target=fwd_compute_mb, args=(mb_idx,))
-        t.start()
-        fwd_threads.append(t)
-    
-    for t in fwd_threads:
-        t.join()
-    
-    # ==================== 反向传播 ====================
-    
-    # 步骤 1：所有非最后阶段提交 irecv
-    if current_stage < model_parallel_size:
-        for mb_idx in reversed(range(num_microbatches)):
-            with record_function(f"Bwd Post Irecv mb_{mb_idx}"):
-                handle = my_stage.backward_irecv(mb_idx, iteration)
-                bwd_recv_handles[mb_idx] = handle
-    
-    # 步骤 2：多线程并行计算
-    def bwd_compute_mb(mb_idx):
-        torch.cuda.set_device(my_stage.device)
-        
-        if my_stage.orion_scheduler is not None:
-            my_stage.orion_scheduler.set_client_idx(mb_idx)
-        
-        current_comp_stream = my_stage.comp_streams[mb_idx]
-        
-        with torch.cuda.stream(current_comp_stream):
-            with record_function(f"Bwd Compute mb_{mb_idx}"):
-                grad_tensor = None
-                if current_stage < model_parallel_size:
-                    bwd_recv_handles[mb_idx].wait()
-                    grad_tensor = my_stage.grad_y_buffers[mb_idx]
-                
-                if current_stage == model_parallel_size:
-                    # 最后阶段：计算损失
-                    loss = my_stage.compute_loss(my_stage.fwd_cache[mb_idx], micro_labels[mb_idx])
-                    loss.backward()
-                else:
-                    my_stage.compute_grad_only(mb_idx, grad_tensor)
-        
-        # 发送
-        if current_stage > 1:
-            with my_stage.comm_stream_lock:
-                with torch.cuda.stream(my_stage.comm_stream):
-                    my_stage.comm_stream.wait_stream(current_comp_stream)
-                    with record_function(f"Bwd Send mb_{mb_idx}"):
-                        handle = my_stage.backward_isend(mb_idx, iteration)
-                        bwd_send_handles[mb_idx] = handle
-    
-    bwd_threads = []
-    for mb_idx in reversed(range(num_microbatches)):
-        t = threading.Thread(target=bwd_compute_mb, args=(mb_idx,))
-        t.start()
-        bwd_threads.append(t)
-    
-    for t in bwd_threads:
-        t.join()
-    
-    # ==================== 同步和更新 ====================
-    
-    # 同步所有流
-    if my_stage.comp_streams:
-        for s in my_stage.comp_streams:
-            torch.cuda.current_stream().wait_stream(s)
-    if my_stage.comm_stream:
-        torch.cuda.current_stream().wait_stream(my_stage.comm_stream)
-    
-    # 等待所有通信完成
-    for handle in fwd_send_handles.values():
-        handle.wait()
-    for handle in bwd_send_handles.values():
-        handle.wait()
-    
-    # 累加梯度（非最后阶段）
-    if current_stage < model_parallel_size:
-        with record_function("Gradient Accumulation"):
-            my_stage.accumulate_gradients()
-    
-    # 参数更新
-    if my_stage.is_training:
-        if config.parallel.data_parallel_size > 1:
-            my_stage.all_reduce_gradients()
-        my_stage.step()
-        my_stage.zero_grad()
-
-
 def main():
     parser = argparse.ArgumentParser(description='GPipe Pipeline Training')
     parser.add_argument('--config', type=str, required=True, help='Path to config YAML file')
+    parser.add_argument('--scheduler', type=str, default=None, 
+                        help='Override scheduler type (naive or async_threaded)')
     args = parser.parse_args()
     
     # 加载配置
     config = PipelineConfig.from_yaml(args.config)
-    config.validate()
+    
+    # 命令行参数覆盖
+    if args.scheduler:
+        config.parallel.scheduler = args.scheduler
     
     # 检查环境变量覆盖
     if os.environ.get('USE_ORION_SCHEDULER', '0') == '1':
         config.parallel.use_orion_scheduler = True
     
+    # 验证配置
+    config.validate()
+    
     # 初始化分布式
     global_rank = setup_distributed()
     DEVICE = get_device()
     
-    print(f"Rank {global_rank}: device={DEVICE}, config={config}")
+    if global_rank == 0:
+        print(f"Config: {config}")
+        print(f"Using scheduler: {config.parallel.scheduler}")
     
     world_size = dist.get_world_size()
     model_parallel_size = config.parallel.model_parallel_size
     data_parallel_size = world_size // model_parallel_size
+    
+    # 更新配置中的 data_parallel_size
+    config.parallel.data_parallel_size = data_parallel_size
     
     # 设置并行组
     model_parallel_groups, data_parallel_groups = setup_parallel_groups(
@@ -292,7 +148,7 @@ def main():
             rank_to_stage[dp * model_parallel_size + mp] = mp + 1
     current_stage = rank_to_stage[global_rank]
     
-    print(f"Rank {global_rank}: stage={current_stage}")
+    print(f"Rank {global_rank}: device={DEVICE}, stage={current_stage}")
     
     # 创建数据集
     dataset_cls = DATASET_REGISTRY.get(config.dataset.name)
@@ -371,6 +227,11 @@ def main():
     )
     my_stage.to(DEVICE)
     
+    # 创建调度器
+    scheduler = SCHEDULER_REGISTRY.create(config.parallel.scheduler, config)
+    if global_rank == 0:
+        print(f"Scheduler: {scheduler}")
+    
     dist.barrier()
     
     # 训练循环
@@ -383,7 +244,9 @@ def main():
         for i, data in tqdm(enumerate(train_loader, 0), disable=(global_rank != 0)):
             # Profiler 设置
             profile_iter = config.training.profile_iteration
-            profiler_dir = f'./profiler_{"orion" if config.parallel.use_orion_scheduler else "baseline"}/rank{global_rank}'
+            scheduler_name = config.parallel.scheduler
+            orion_suffix = "_orion" if config.parallel.use_orion_scheduler else ""
+            profiler_dir = f'./profiler_{scheduler_name}{orion_suffix}/rank{global_rank}'
             
             profiler_context = torch.profiler.profile(
                 activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
@@ -395,8 +258,8 @@ def main():
             
             # 准备数据
             inputs, labels = data['inputs'].to(DEVICE), data['labels'].to(DEVICE)
-            micro_inputs = torch.chunk(inputs, num_microbatches)
-            micro_labels = torch.chunk(labels, num_microbatches)
+            micro_inputs = list(torch.chunk(inputs, num_microbatches))
+            micro_labels = list(torch.chunk(labels, num_microbatches))
             
             if global_rank == 0 and i % 50 == 0:
                 print(f"\n################## iteration {i} ##################")
@@ -404,15 +267,13 @@ def main():
             dist.barrier()
             
             with profiler_context:
-                train_iteration(
-                    my_stage=my_stage,
+                # 使用调度器执行训练迭代
+                scheduler.run_iteration(
+                    stage=my_stage,
                     micro_inputs=micro_inputs,
                     micro_labels=micro_labels,
                     iteration=i,
-                    config=config,
-                    current_stage=current_stage,
-                    model_parallel_size=model_parallel_size,
-                    num_microbatches=num_microbatches
+                    current_stage=current_stage
                 )
             
             dist.barrier()

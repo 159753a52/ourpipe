@@ -450,6 +450,60 @@ class BaseStage(StageInterface, ABC):
             mb_idx
         )
     
+    # ==================== 同步通信方法（用于 Naive 调度器）====================
+    
+    def forward_send(self, out: torch.Tensor) -> None:
+        """同步发送前向传播的输出到下一阶段
+        
+        阻塞式发送，直到数据被接收方接收。
+        
+        Args:
+            out: 要发送的输出张量
+        """
+        dst = self.global_rank + 1
+        dist.send(tensor=out, dst=dst, tag=self.stage_id, group=self.model_parallel_group)
+    
+    def forward_recv(self, mb_idx: int) -> None:
+        """同步接收上一阶段的前向传播输出
+        
+        阻塞式接收，直到数据到达。
+        接收的数据存储在 self.out_x_buffers[mb_idx] 中。
+        
+        Args:
+            mb_idx: micro-batch 索引
+        """
+        src = self.global_rank - 1
+        tensor_to_recv = self.out_x_buffers[mb_idx]
+        dist.recv(tensor=tensor_to_recv, src=src, tag=self.stage_id - 1, group=self.model_parallel_group)
+        self.out_x_buffers[mb_idx] = tensor_to_recv.to(self.device)
+    
+    def backward_send(self, mb_idx: int) -> None:
+        """同步发送反向传播的梯度到上一阶段
+        
+        阻塞式发送，直到数据被接收方接收。
+        
+        Args:
+            mb_idx: micro-batch 索引
+        """
+        cached_input = self.input_cache[mb_idx]
+        grad = cached_input.grad  # dL/dX
+        dst = self.global_rank - 1
+        dist.send(grad, dst=dst, group=self.model_parallel_group)
+    
+    def backward_recv(self, mb_idx: int) -> None:
+        """同步接收下一阶段的反向传播梯度
+        
+        阻塞式接收，直到数据到达。
+        接收的数据存储在 self.grad_y_buffers[mb_idx] 中。
+        
+        Args:
+            mb_idx: micro-batch 索引
+        """
+        src = self.global_rank + 1
+        tensor_to_recv = self.grad_y_buffers[mb_idx]
+        dist.recv(tensor_to_recv, src=src, group=self.model_parallel_group)
+        self.grad_y_buffers[mb_idx] = tensor_to_recv.to(self.device)
+    
     def all_reduce_gradients(self):
         """在数据并行组内对梯度进行 AllReduce 操作"""
         for param in self.sub_model.parameters():
