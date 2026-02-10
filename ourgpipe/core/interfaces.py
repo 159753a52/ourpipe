@@ -109,6 +109,25 @@ class ModelInterface(ABC):
         """
         pass
     
+    def get_flops_per_token(self, num_params: Optional[int] = None) -> int:
+        """返回每个 token 的 FLOPs（前向 + 反向）
+        
+        用于计算 MFU (Model FLOPs Utilization)。
+        默认实现使用 6 × num_params 的近似公式。
+        子类可以重写此方法提供更精确的计算。
+        
+        Args:
+            num_params: 模型参数量，如果为 None 则需要子类自行计算
+            
+        Returns:
+            int: 每个 token 的 FLOPs
+        """
+        if num_params is None:
+            raise ValueError("num_params is required for default FLOPs estimation")
+        # 默认使用 6 × params 的近似公式
+        # 前向传播 ≈ 2 × params，反向传播 ≈ 4 × params
+        return 6 * num_params
+    
     def init_model(self) -> nn.ModuleList:
         """根据配置初始化完整模型
         

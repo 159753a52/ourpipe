@@ -5,7 +5,7 @@ GPT 模型适配器
 """
 
 import torch.nn as nn
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 
 from core.interfaces import ModelInterface
 from core.registry import MODEL_REGISTRY
@@ -153,6 +153,72 @@ class GPTModel(ModelInterface):
     def get_vocab_size(self) -> int:
         """返回词表大小"""
         return self.vocab_size
+    
+    def get_flops_per_token(self, num_params: Optional[int] = None) -> int:
+        """返回每个 token 的 FLOPs（前向 + 反向）
+        
+        GPT 模型的 FLOPs 计算公式（参考 PaLM 论文）：
+        
+        每个 token 的前向 FLOPs ≈ 2 × num_params + 2 × num_layers × seq_len × hidden_size
+        
+        其中：
+        - 2 × num_params: 矩阵乘法的 FLOPs
+        - 2 × num_layers × seq_len × hidden_size: 注意力的 FLOPs
+        
+        反向传播 ≈ 2 × 前向，所以总共 ≈ 6 × num_params（近似）
+        
+        Args:
+            num_params: 模型参数量，如果为 None 则使用估算值
+            
+        Returns:
+            每个 token 的 FLOPs
+        """
+        if num_params is None:
+            # 估算参数量
+            # GPT: params ≈ 12 × L × H² + V × H
+            num_params = (
+                12 * self.num_layers * self.hidden_size ** 2 +
+                self.vocab_size * self.hidden_size
+            )
+
+        # 简化版本：使用 6 × params 的近似
+        # 这是业界常用的估算方法
+        return 6 * num_params
+    
+    def estimate_params(self) -> int:
+        """估算模型参数量
+        
+        GPT 参数量公式：
+        - Token Embedding: vocab_size × hidden_size
+        - Position Embedding: seq_len × hidden_size
+        - 每个 Transformer 层: 12 × hidden_size²
+          - Attention (Q, K, V, O): 4 × hidden_size²
+          - FFN: 8 × hidden_size² (4H → H 和 H → 4H)
+          - LayerNorm: 2 × hidden_size (可忽略)
+        - Final LayerNorm: hidden_size
+        - LM Head: hidden_size × vocab_size
+        
+        Returns:
+            估算的参数量
+        """
+        params = 0
+        
+        # Token Embedding
+        params += self.vocab_size * self.hidden_size
+        
+        # Position Embedding
+        params += self.sequence_length * self.hidden_size
+        
+        # Transformer 层
+        params += self.num_layers * 12 * self.hidden_size ** 2
+        
+        # Final LayerNorm
+        params += self.hidden_size
+        
+        # LM Head (通常与 Token Embedding 共享权重，但这里假设不共享)
+        params += self.hidden_size * self.vocab_size
+        
+        return params
     
     def __repr__(self) -> str:
         return (

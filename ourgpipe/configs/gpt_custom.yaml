@@ -1,0 +1,36 @@
+# GPT Custom 配置
+# 自定义配置文件
+
+model:
+  name: gpt
+  hidden_size: 4096  
+  num_layers: 16  
+  num_heads: 32  
+  sequence_length: 128  
+  vocab_size: -1
+  extra:
+    head_size: 128
+    ff_low_rank: null
+    dropout: 0.1
+
+dataset:
+  name: code_search_net
+  batch_size: 32  # batch_size
+  num_workers: 0
+  extra: {}
+
+training:
+  learning_rate: 0.0001  # 1e-4
+  epochs: 2
+  num_microbatches: 4
+  gradient_accumulation: 1
+  max_iterations: -1
+  # eval_iters: 20
+  profile_iteration: 100
+  exit_after_profile: false
+
+parallel:
+  model_parallel_size: 4
+  data_parallel_size: 1
+  scheduler: naive    #naive async_threaded
+  use_orion_scheduler: false

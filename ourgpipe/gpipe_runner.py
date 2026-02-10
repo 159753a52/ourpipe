@@ -3,14 +3,15 @@
 GPipe 流水线并行训练 - 模型无关的主入口
 
 使用方法:
+    cd orion-docker/ourgpipe
     source /home/bingxing2/home/scx9kvs/mxy/env.sh
     conda activate pai-megatron
     
-    # 使用异步多线程调度器（默认，高性能）
-    torchrun --nproc_per_node=4 --master_port=29500 gpipe_runner.py --config configs/gpt_small.yaml
+    # custom.yaml
+    torchrun --nproc_per_node=4 --master_port=29500 gpipe_runner.py --config configs/gpt_custom.yaml
     
-    # 使用 Naive 同步调度器（简单，适合调试）
-    torchrun --nproc_per_node=4 --master_port=29500 gpipe_runner.py --config configs/gpt_small_naive.yaml
+    # small.yaml
+    torchrun --nproc_per_node=4 --master_port=29500 gpipe_runner.py --config configs/gpt_small.yaml
     
     # 启用 Orion 调度器
     export USE_ORION_SCHEDULER=1
@@ -30,6 +31,12 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import DataLoader
 import torch.profiler
 
+# torch.backends.cuda.matmul.allow_tf32 = True
+# torch.backends.cudnn.allow_tf32 = True
+
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
+
 import argparse
 import datetime
 import os
@@ -41,6 +48,7 @@ from tqdm import tqdm
 from core.config import PipelineConfig
 from core.registry import MODEL_REGISTRY, DATASET_REGISTRY, STAGE_REGISTRY
 from core.schedulers import SCHEDULER_REGISTRY
+from core.metrics import MetricsTracker, collect_model_params
 
 # 导入模型实现（触发注册）
 import models
@@ -230,12 +238,41 @@ def main():
     # 创建调度器
     scheduler = SCHEDULER_REGISTRY.create(config.parallel.scheduler, config)
     if global_rank == 0:
-        print(f"Scheduler: {scheduler}")
+        print(f"Scheduler: {scheduler}", flush=True)
+    
+    dist.barrier()
+    
+    # 收集模型总参数量
+    total_model_params = collect_model_params(
+        my_stage, model_parallel_group, torch.device(DEVICE)
+    )
+    
+    # 获取 FLOPs per token
+    flops_per_token = model_adapter.get_flops_per_token(total_model_params)
+    
+    if global_rank == 0:
+        print(f"Total Model Parameters: {total_model_params:,}", flush=True)
+        print(f"FLOPs per token: {flops_per_token:,}", flush=True)
+    
+    # 创建指标追踪器
+    device_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
+    metrics_tracker = MetricsTracker(
+        batch_size=config.dataset.batch_size,
+        sequence_length=config.model.sequence_length,
+        num_gpus=world_size,
+        device_name=device_name,
+        warmup_iterations=10,
+        dtype='tf32'  # 默认使用 TF32
+    )
     
     dist.barrier()
     
     # 训练循环
     num_microbatches = config.training.num_microbatches
+    total_iterations = 0
+    
+    # 开始追踪
+    metrics_tracker.start()
     
     for epoch in range(config.training.epochs):
         if train_sampler is not None:
@@ -250,9 +287,12 @@ def main():
             
             profiler_context = torch.profiler.profile(
                 activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
-                record_shapes=True,
-                with_stack=True,
-                profile_memory=True,
+                # record_shapes=True,
+                # with_stack=True,
+                # profile_memory=True,
+                record_shapes=False,     # 关闭形状记录
+                with_stack=False,        # 关闭调用栈记录（节省大量内存）
+                profile_memory=False,
                 on_trace_ready=torch.profiler.tensorboard_trace_handler(profiler_dir)
             ) if i == profile_iter else contextlib.nullcontext()
             
@@ -262,7 +302,9 @@ def main():
             micro_labels = list(torch.chunk(labels, num_microbatches))
             
             if global_rank == 0 and i % 50 == 0:
-                print(f"\n################## iteration {i} ##################")
+                # 输出当前进度和吞吐量
+                current_throughput = metrics_tracker.get_throughput()
+                print(f"\n################## iteration {i} | throughput: {current_throughput:,.0f} tokens/s ##################", flush=True)
             
             dist.barrier()
             
@@ -279,17 +321,38 @@ def main():
             dist.barrier()
             torch.cuda.synchronize()
             
+            # 记录迭代完成
+            metrics_tracker.step()
+            total_iterations += 1
+            
             # 检查是否退出
             max_iter = config.training.max_iterations
             if max_iter > 0 and i >= max_iter:
                 break
             
             if config.training.exit_after_profile and i == profile_iter + 10:
-                print(f"Profiling finished at iteration {i}. Exiting.")
+                print(f"Profiling finished at iteration {i}. Exiting.", flush=True)
+                # 停止追踪并输出汇总
+                metrics_tracker.stop()
+                if global_rank == 0:
+                    metrics_tracker.print_summary(
+                        model_params=total_model_params,
+                        flops_per_token=flops_per_token
+                    )
                 my_stage.stop_orion_scheduler()
                 dist.barrier()
                 dist.destroy_process_group()
                 sys.exit(0)
+    
+    # 停止追踪
+    metrics_tracker.stop()
+    
+    # 输出训练汇总（只在 rank 0）
+    if global_rank == 0:
+        metrics_tracker.print_summary(
+            model_params=total_model_params,
+            flops_per_token=flops_per_token
+        )
     
     # 清理
     my_stage.stop_orion_scheduler()

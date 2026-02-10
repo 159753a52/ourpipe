@@ -1,0 +1,46 @@
+# 显存估算：
+#   - 模型参数 (每 stage): ~200M params × 4 bytes = ~800MB
+#   - 优化器状态 (Adam): ~200M × 8 bytes = ~1.6GB
+#   - 梯度: ~200M × 4 bytes = ~800MB
+#   - 激活值缓存: batch × seq × hidden × layers_per_stage × microbatches × 4 bytes
+#                 = 8 × 1024 × 1536 × 6 × 8 × 4 ≈ 2.4GB per microbatch → ~19GB total
+#   - 通信缓冲区: ~1GB
+#   - 总计: ~23-25GB (基础) + 激活值动态增长
+#
+# 如果 OOM，可以尝试：
+#   1. 减小 batch_size 到 32
+#   2. 减小 sequence_length 到 512
+#   3. 减小 num_microbatches 到 6
+
+model:
+  name: gpt
+  hidden_size: 1536       # GPT-Large 级别
+  num_layers: 24          # 24 层，每 stage 6 层
+  num_heads: 24           # 1536 / 24 = 64 (head_size)
+  sequence_length: 512   # 较长序列以增加激活值
+  vocab_size: -1          # 从数据集获取
+  extra:
+    # head_size: 64         # 1536 / 24 = 64
+    ff_low_rank: null     # 不使用低秩分解
+    dropout: 0.1          # 较小的 dropout
+
+dataset:
+  name: code_search_net
+  batch_size: 32          # 全局 batch size
+  num_workers: 4
+  extra: {}
+
+training:
+  learning_rate: 0.0001
+  epochs: 2
+  num_microbatches: 8     # 8 个 micro-batch，每个 micro-batch 6 samples
+  gradient_accumulation: 1
+  max_iterations: -1 
+  profile_iteration: 50      # -1 表示禁用
+  exit_after_profile: true   #
+
+parallel:
+  model_parallel_size: 4  # 4 个 stage
+  data_parallel_size: 1
+  scheduler: naive  # naive / async_threaded
+  use_orion_scheduler: false

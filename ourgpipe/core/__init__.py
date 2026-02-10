@@ -9,6 +9,7 @@ from .config import PipelineConfig, ModelConfig, DatasetConfig, TrainingConfig, 
 from .registry import MODEL_REGISTRY, DATASET_REGISTRY, STAGE_REGISTRY
 from .stage import BaseStage
 from .schedulers import BaseScheduler, SCHEDULER_REGISTRY, NaiveScheduler, AsyncThreadedScheduler
+from .metrics import MetricsTracker, collect_model_params, get_gpu_peak_flops
 
 __all__ = [
     # 接口
@@ -32,4 +33,8 @@ __all__ = [
     # 调度器
     'NaiveScheduler',
     'AsyncThreadedScheduler',
+    # 指标追踪
+    'MetricsTracker',
+    'collect_model_params',
+    'get_gpu_peak_flops',
 ]
