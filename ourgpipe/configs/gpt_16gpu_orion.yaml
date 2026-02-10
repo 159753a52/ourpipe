@@ -1,0 +1,46 @@
+# GPT 模型配置 - 16 GPU (4 节点) - Async 多流调度器
+# 
+# 基于 gpt_custom.yaml 成功配置扩展
+# 架构: 4 节点 × 4 GPU = 16 个 stage
+# 调度器: Async Threaded (异步多线程)
+#
+# 优化配置：高计算/通信比，让多流调度器有优势
+#   - hidden_size=4096: 大矩阵运算，GPU 计算密集
+#   - sequence_length=128: 小通信量
+#   - num_layers=64: 16 stages × 4 layers
+#   - num_microbatches=16: 更多并行机会
+#
+# 多流调度器优势：通信与计算重叠，多 micro-batch 并行
+
+model:
+  name: gpt
+  hidden_size: 4096       # 大 hidden_size，增加计算量
+  num_layers: 64          # 64 层，每 stage 4 层 (16 stages × 4)
+  num_heads: 32           # 4096 / 32 = 128 (head_size)
+  sequence_length: 128    # 小 sequence_length，减少通信量
+  vocab_size: -1          # 从数据集获取
+  extra:
+    head_size: 128        # 4096 / 32 = 128
+    ff_low_rank: null     # 不使用低秩分解
+    dropout: 0.1
+
+dataset:
+  name: code_search_net
+  batch_size: 32
+  num_workers: 4
+  extra: {}
+
+training:
+  learning_rate: 0.0001
+  epochs: 2
+  num_microbatches: 16    # 增加到 16，更多并行机会
+  gradient_accumulation: 1
+  max_iterations: -1 
+  profile_iteration: 50
+  exit_after_profile: true
+
+parallel:
+  model_parallel_size: 16  # 16 个 stage (4 节点 × 4 GPU)
+  data_parallel_size: 1
+  scheduler: async_threaded  # 异步多线程调度器
+  use_orion_scheduler: false # 不启用 Orion 调度器

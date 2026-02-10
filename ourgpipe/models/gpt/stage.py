@@ -7,7 +7,7 @@ GPT Stage 实现
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List
+from typing import List, Dict, Any
 
 from core.stage import BaseStage
 from core.registry import STAGE_REGISTRY
@@ -36,7 +36,8 @@ class GPTStage(BaseStage):
     def __init__(
         self,
         stage_id: int,
-        model_layers: nn.ModuleList,
+        model_adapter,
+        model_config: Dict[str, Any],
         layer_indices: List[int],
         config: PipelineConfig,
         device: torch.device,
@@ -46,11 +47,12 @@ class GPTStage(BaseStage):
         model_parallel_size: int,
         data_parallel_size: int
     ):
-        """初始化 GPT Stage
+        """初始化 GPT Stage（延迟初始化）
         
         Args:
             stage_id: 阶段 ID（从 1 开始）
-            model_layers: 完整模型的所有层
+            model_adapter: 模型适配器实例，用于创建层
+            model_config: 模型配置字典（由 init_model() 返回）
             layer_indices: 该阶段包含的层索引
             config: 流水线配置
             device: 计算设备
@@ -60,14 +62,11 @@ class GPTStage(BaseStage):
             model_parallel_size: 模型并行大小
             data_parallel_size: 数据并行大小
         """
-        # 保存嵌入层引用（在调用父类初始化之前）
-        self._model_layers = model_layers
-        self._layer_indices = layer_indices
-        
-        # 调用父类初始化
+        # 调用父类初始化（会调用 create_sub_model）
         super().__init__(
             stage_id=stage_id,
-            model_layers=model_layers,
+            model_adapter=model_adapter,
+            model_config=model_config,
             layer_indices=layer_indices,
             config=config,
             device=device,
@@ -80,37 +79,71 @@ class GPTStage(BaseStage):
     
     def create_sub_model(
         self,
-        model_layers: nn.ModuleList,
+        model_adapter,
+        model_config: Dict[str, Any],
         layer_indices: List[int]
     ) -> nn.Module:
-        """创建 GPT 子模型
+        """创建 GPT 子模型（延迟初始化，按需创建层）
         
         第一阶段需要特殊处理：
-        - 保存嵌入层引用（用于 prepare_input）
+        - 创建并保存嵌入层引用（用于 prepare_input）
         - 子模型只包含 Transformer 块
         
+        其他阶段：
+        - 按需创建 Transformer 块
+        
         Args:
-            model_layers: 完整模型的所有层
+            model_adapter: 模型适配器实例，用于创建层
+            model_config: 模型配置字典
             layer_indices: 该阶段包含的层索引
             
         Returns:
             该阶段的子模型
         """
+        # 获取层名称列表
+        layer_names = list(model_config.keys())
+        
         if self.stage_id == 1:
-            # 第一阶段：保存嵌入层引用
+            # 第一阶段：创建嵌入层
             # layer_indices[0] = em_tokn, layer_indices[1] = em_pos
-            self.token_embedding = model_layers[layer_indices[0]]
-            self.position_embedding = model_layers[layer_indices[1]]
+            tokn_name = layer_names[layer_indices[0]]
+            pos_name = layer_names[layer_indices[1]]
             
-            # 子模型只包含 Transformer 块（跳过嵌入层）
+            # 按需创建嵌入层
+            self.token_embedding = model_adapter.create_layer(
+                tokn_name,
+                model_config[tokn_name]
+            )
+            self.position_embedding = model_adapter.create_layer(
+                pos_name,
+                model_config[pos_name]
+            )
+            
+            # 创建 Transformer 块（如果有）
             if len(layer_indices) > 2:
-                return nn.Sequential(*[model_layers[i] for i in layer_indices[2:]])
+                transformer_layers = []
+                for idx in layer_indices[2:]:
+                    layer_name = layer_names[idx]
+                    layer = model_adapter.create_layer(
+                        layer_name,
+                        model_config[layer_name]
+                    )
+                    transformer_layers.append(layer)
+                return nn.Sequential(*transformer_layers)
             else:
                 # 如果只有嵌入层，返回一个恒等映射
                 return nn.Identity()
         else:
-            # 其他阶段：直接使用指定的层
-            return nn.Sequential(*[model_layers[i] for i in layer_indices])
+            # 其他阶段：按需创建层
+            layers = []
+            for idx in layer_indices:
+                layer_name = layer_names[idx]
+                layer = model_adapter.create_layer(
+                    layer_name,
+                    model_config[layer_name]
+                )
+                layers.append(layer)
+            return nn.Sequential(*layers)
     
     def prepare_input(self, x: torch.Tensor, mb_idx: int) -> torch.Tensor:
         """准备 GPT 输入

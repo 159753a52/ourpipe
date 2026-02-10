@@ -50,7 +50,8 @@ class BaseStage(StageInterface, ABC):
     def __init__(
         self,
         stage_id: int,
-        model_layers: nn.ModuleList,
+        model_adapter,
+        model_config: Dict[str, Any],
         layer_indices: List[int],
         config: PipelineConfig,
         device: torch.device,
@@ -60,11 +61,12 @@ class BaseStage(StageInterface, ABC):
         model_parallel_size: int,
         data_parallel_size: int
     ):
-        """初始化流水线阶段
+        """初始化流水线阶段（延迟初始化）
         
         Args:
             stage_id: 阶段 ID（从 1 开始）
-            model_layers: 完整模型的所有层
+            model_adapter: 模型适配器实例，用于创建层
+            model_config: 模型配置字典（由 init_model() 返回）
             layer_indices: 该阶段包含的层索引
             config: 流水线配置
             device: 计算设备
@@ -80,6 +82,10 @@ class BaseStage(StageInterface, ABC):
         self.config = config
         self.is_training = True
         
+        # 保存模型适配器和配置（用于延迟初始化）
+        self.model_adapter = model_adapter
+        self.model_config = model_config
+        
         # 分布式相关
         self.model_parallel_group = model_parallel_group
         self.data_parallel_group = data_parallel_group
@@ -92,8 +98,8 @@ class BaseStage(StageInterface, ABC):
         self.num_microbatches = config.training.num_microbatches
         self.micro_batch_size = config.dataset.batch_size // self.num_microbatches
         
-        # 创建子模型（由子类实现）
-        self.sub_model = self.create_sub_model(model_layers, layer_indices)
+        # 创建子模型（由子类实现，按需创建层）
+        self.sub_model = self.create_sub_model(model_adapter, model_config, layer_indices)
         
         # 优化器
         self.optimizer = optim.Adam(
@@ -124,19 +130,35 @@ class BaseStage(StageInterface, ABC):
     @abstractmethod
     def create_sub_model(
         self,
-        model_layers: nn.ModuleList,
+        model_adapter,
+        model_config: Dict[str, Any],
         layer_indices: List[int]
     ) -> nn.Module:
-        """创建该阶段的子模型
+        """创建该阶段的子模型（延迟初始化）
         
         子类需要实现此方法来处理特定模型的层组织方式。
+        例如，GPT 的第一阶段需要特殊处理嵌入层。
+        
+        注意：此方法接收模型配置而非层实例，需要按需创建层。
+        这样可以避免每个进程都创建完整模型，节省内存。
         
         Args:
-            model_layers: 完整模型的所有层
+            model_adapter: 模型适配器实例，用于创建层
+            model_config: 模型配置字典（由 init_model() 返回）
             layer_indices: 该阶段包含的层索引
             
         Returns:
             该阶段的子模型
+            
+        示例:
+            # 按需创建层
+            layer_names = list(model_config.keys())
+            layers = []
+            for idx in layer_indices:
+                layer_name = layer_names[idx]
+                layer = model_adapter.create_layer(layer_name, model_config[layer_name])
+                layers.append(layer)
+            return nn.Sequential(*layers)
         """
         pass
     

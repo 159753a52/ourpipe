@@ -23,19 +23,10 @@ import torch.multiprocessing as mp
 mp.set_start_method('spawn', force=True)
 
 import torch
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-
 import torch.distributed as dist
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import DataLoader
 import torch.profiler
-
-# torch.backends.cuda.matmul.allow_tf32 = True
-# torch.backends.cudnn.allow_tf32 = True
-
-torch.backends.cuda.matmul.allow_tf32 = False
-torch.backends.cudnn.allow_tf32 = False
 
 import argparse
 import datetime
@@ -127,6 +118,21 @@ def main():
     # 验证配置
     config.validate()
     
+    # 根据调度器类型设置 TF32
+    if config.parallel.scheduler == 'naive':
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        print("TF32 disabled for Naive scheduler (fair comparison)")
+    elif config.parallel.scheduler == 'async_threaded' and config.parallel.use_orion_scheduler:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        print("TF32 enabled for Async Threaded + Orion scheduler (performance boost)")
+    else:
+        # 默认关闭 TF32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        print("TF32 disabled by default")
+    
     # 初始化分布式
     global_rank = setup_distributed()
     DEVICE = get_device()
@@ -201,13 +207,15 @@ def main():
     if global_rank == 0:
         print(f"Training steps per epoch: {len(train_loader)}")
     
-    # 创建模型
+    # 创建模型适配器
     model_cls = MODEL_REGISTRY.get(config.model.name)
     if model_cls is None:
         raise ValueError(f"Model '{config.model.name}' not found. Available: {MODEL_REGISTRY.list_registered()}")
     
     model_adapter = model_cls(config.model)
-    model_layers = model_adapter.init_model()
+    
+    # 获取模型配置（延迟初始化，不创建层实例）
+    model_config = model_adapter.init_model()
     
     # 获取阶段划分
     partitions = model_adapter.get_stage_partition(model_parallel_size)
@@ -215,15 +223,17 @@ def main():
     
     if global_rank == 0:
         print(f"Stage partitions: {partitions}")
+        print(f"Using lazy initialization: each stage will create only its required layers")
     
-    # 创建 Stage
+    # 创建 Stage（传递适配器和配置，而非完整模型）
     stage_cls = STAGE_REGISTRY.get(config.model.name)
     if stage_cls is None:
         raise ValueError(f"Stage '{config.model.name}' not found. Available: {STAGE_REGISTRY.list_registered()}")
     
     my_stage = stage_cls(
         stage_id=current_stage,
-        model_layers=model_layers,
+        model_adapter=model_adapter,
+        model_config=model_config,
         layer_indices=layer_indices,
         config=config,
         device=torch.device(DEVICE),

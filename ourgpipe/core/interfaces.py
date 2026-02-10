@@ -128,18 +128,46 @@ class ModelInterface(ABC):
         # 前向传播 ≈ 2 × params，反向传播 ≈ 4 × params
         return 6 * num_params
     
-    def init_model(self) -> nn.ModuleList:
-        """根据配置初始化完整模型
+    def init_model(self) -> Dict[str, Any]:
+        """返回模型配置字典（延迟初始化）
         
-        这是一个便捷方法，使用 get_model_config() 和 create_layer() 
-        创建完整的模型层列表。
+        这是一个便捷方法，返回 get_model_config() 的结果。
+        实际的层创建由 create_layers_for_stage() 完成。
+        
+        注意：此方法不再创建层实例，只返回配置信息。
+        这样可以避免每个进程都创建完整模型，节省内存。
         
         Returns:
-            nn.ModuleList: 包含所有模型层的列表
+            Dict[str, Any]: 模型配置字典，键是层名称，值是层参数
+        """
+        return self.get_model_config()
+    
+    def create_layers_for_stage(
+        self,
+        model_config: Dict[str, Any],
+        layer_indices: List[int]
+    ) -> nn.ModuleList:
+        """根据配置和索引创建指定阶段的层
+        
+        这是延迟初始化的核心方法，只创建当前阶段需要的层。
+        
+        Args:
+            model_config: 模型配置字典（由 init_model() 返回）
+            layer_indices: 要创建的层索引列表
+            
+        Returns:
+            nn.ModuleList: 创建的层列表
+            
+        示例:
+            # 假设 model_config 有 32 个层，当前阶段只需要层 0, 1, 2
+            layers = model_adapter.create_layers_for_stage(config, [0, 1, 2])
+            # 只创建 3 个层，而不是 32 个
         """
         model = nn.ModuleList()
-        config = self.get_model_config()
-        for layer_type, params in config.items():
+        layer_names = list(model_config.keys())
+        for idx in layer_indices:
+            layer_type = layer_names[idx]
+            params = model_config[layer_type]
             layer = self.create_layer(layer_type, params)
             model.append(layer)
         return model
@@ -209,21 +237,36 @@ class StageInterface(ABC):
     
     @abstractmethod
     def create_sub_model(
-        self, 
-        model_layers: nn.ModuleList, 
+        self,
+        model_adapter: 'ModelInterface',
+        model_config: Dict[str, Any],
         layer_indices: List[int]
     ) -> nn.Module:
-        """创建该阶段的子模型
+        """创建该阶段的子模型（延迟初始化）
         
         子类需要实现此方法来处理特定模型的层组织方式。
         例如，GPT 的第一阶段需要特殊处理嵌入层。
         
+        注意：此方法接收模型配置而非层实例，需要按需创建层。
+        这样可以避免每个进程都创建完整模型，节省内存。
+        
         Args:
-            model_layers: 完整模型的所有层
+            model_adapter: 模型适配器实例，用于创建层
+            model_config: 模型配置字典（由 init_model() 返回）
             layer_indices: 该阶段包含的层索引
             
         Returns:
             nn.Module: 该阶段的子模型
+            
+        示例:
+            # 按需创建层
+            layer_names = list(model_config.keys())
+            layers = []
+            for idx in layer_indices:
+                layer_name = layer_names[idx]
+                layer = model_adapter.create_layer(layer_name, model_config[layer_name])
+                layers.append(layer)
+            return nn.Sequential(*layers)
         """
         pass
 

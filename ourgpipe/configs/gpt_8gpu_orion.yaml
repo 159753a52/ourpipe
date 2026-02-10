@@ -1,0 +1,44 @@
+# GPT 模型配置 - 8 GPU (2 节点) - Orion 调度器
+# 
+# 架构: 2 节点 × 4 GPU = 8 个 stage
+# 调度器: Async Threaded + Orion 多优先级调度
+# TF32: 开启（提升性能）
+#
+# 保守配置以避免 OOM:
+#   - 减小 hidden_size 到 1024
+#   - 减小 batch_size 到 16
+#   - 减小 sequence_length 到 256
+#   - 每 stage 只有 2 层
+
+model:
+  name: gpt
+  hidden_size: 1024         # 减小到 1024
+  num_layers: 16            # 16 层，每 stage 2 层
+  num_heads: 16             # 1024 / 16 = 64 (head_size)
+  sequence_length: 256      # 减小到 256
+  vocab_size: -1            # 从数据集获取
+  extra:
+    head_size: 64           # 1024 / 16 = 64
+    ff_low_rank: null       # 不使用低秩分解
+    dropout: 0.1
+
+dataset:
+  name: code_search_net
+  batch_size: 16            # 减小到 16
+  num_workers: 4
+  extra: {}
+
+training:
+  learning_rate: 0.0001
+  epochs: 2
+  num_microbatches: 8       # 8 个 micro-batch (每个 2 samples)
+  gradient_accumulation: 1
+  max_iterations: -1 
+  profile_iteration: 50
+  exit_after_profile: true
+
+parallel:
+  model_parallel_size: 8    # 8 个 stage (2 节点 × 4 GPU)
+  data_parallel_size: 1
+  scheduler: async_threaded # 异步多线程调度器
+  use_orion_scheduler: true # 启用 Orion 多优先级调度

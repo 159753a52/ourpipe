@@ -21,7 +21,7 @@ dataset:
 training:
   learning_rate: 0.0001
   epochs: 2
-  num_microbatches: 8   # 更多 micro-batch 以提高流水线效率
+  num_microbatches: 8   
   gradient_accumulation: 1
   max_iterations: -1
   profile_iteration: 100
