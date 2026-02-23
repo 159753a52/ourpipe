@@ -538,19 +538,37 @@ class BaseStage(StageInterface, ABC):
                 param.grad /= self.data_parallel_size
     
     def accumulate_gradients(self):
-        """累加 grad_buffers 中的梯度到参数"""
+        """累加 grad_buffers 中的梯度到参数
+        
+        优化版本：避免 clone 操作，使用 in-place 累加减少内存峰值。
+        
+        原问题：clone() 操作会在内存中创建梯度副本，当有 16 个 micro-batch 时，
+        所有梯度同时存在于 grad_buffers 中，加上 clone 产生的副本，导致内存峰值
+        翻倍，最终 OOM。
+        
+        修复方案：
+        1. 第一个梯度直接赋值给 param.grad，不 clone
+        2. 后续梯度使用 in-place 加法 (add_)
+        """
         params = list(self.sub_model.parameters())
         for param_idx, param in enumerate(params):
+            first_grad_assigned = False
             for mb_idx in range(self.num_microbatches):
                 grads = self.grad_buffers[mb_idx]
-                if grads is not None:
+                if grads is not None and param_idx < len(grads):
                     mb_grad = grads[param_idx]
-                    if param.grad is None:
-                        param.grad = mb_grad.clone()
+                    if mb_grad is None:
+                        continue
+                    if not first_grad_assigned:
+                        # 第一个梯度：直接赋值，不 clone
+                        # 注意：这会使 grad_buffers 中的引用失效，但我们之后会清空它
+                        param.grad = mb_grad
+                        first_grad_assigned = True
                     else:
-                        param.grad += mb_grad
+                        # 后续梯度：使用 in-place 加法
+                        param.grad.add_(mb_grad)
         
-        # 清空 buffer
+        # 清空 buffer，释放内存
         self.grad_buffers = [None] * self.num_microbatches
     
     def step(self):

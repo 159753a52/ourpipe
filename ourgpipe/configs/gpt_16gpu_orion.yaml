@@ -14,14 +14,14 @@
 
 model:
   name: gpt
-  hidden_size: 4096       # 大 hidden_size，增加计算量
-  num_layers: 64          # 64 层，每 stage 4 层 (16 stages × 4)
-  num_heads: 32           # 4096 / 32 = 128 (head_size)
-  sequence_length: 128    # 小 sequence_length，减少通信量
-  vocab_size: -1          # 从数据集获取
+  hidden_size: 4096       
+  num_layers: 64          
+  num_heads: 32           
+  sequence_length: 128    
+  vocab_size: -1          
   extra:
-    head_size: 128        # 4096 / 32 = 128
-    ff_low_rank: null     # 不使用低秩分解
+    head_size: 128        
+    ff_low_rank: null     
     dropout: 0.1
 
 dataset:
@@ -33,7 +33,7 @@ dataset:
 training:
   learning_rate: 0.0001
   epochs: 2
-  num_microbatches: 16    # 增加到 16，更多并行机会
+  num_microbatches: 4    # 增加到 16，更多并行机会
   gradient_accumulation: 1
   max_iterations: -1 
   profile_iteration: 50

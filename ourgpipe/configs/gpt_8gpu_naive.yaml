@@ -19,32 +19,34 @@
 
 model:
   name: gpt
-  hidden_size: 1536       # 保持与 1node 相同
-  num_layers: 48          # 48 层，每 stage 6 层 (8 stages × 6)
-  num_heads: 24           # 1536 / 24 = 64 (head_size)
-  sequence_length: 512    # 保持与 1node 相同
+  hidden_size: 4096       # 大 hidden_size，增加计算量
+  num_layers: 32          # 64 层，每 stage 4 层 (16 stages × 4)
+  num_heads: 32           # 4096 / 32 = 128 (head_size)
+  sequence_length: 128    # 小 sequence_length，减少通信量
   vocab_size: -1          # 从数据集获取
   extra:
+    head_size: 128        # 4096 / 32 = 128
     ff_low_rank: null     # 不使用低秩分解
     dropout: 0.1
 
 dataset:
   name: code_search_net
-  batch_size: 32          # 保持与 1node 相同
+  batch_size: 32
   num_workers: 4
   extra: {}
 
 training:
   learning_rate: 0.0001
   epochs: 2
-  num_microbatches: 8     # 保持与 1node 相同
+  num_microbatches: 2    # 增加到 16，更多并行机会
   gradient_accumulation: 1
   max_iterations: -1 
   profile_iteration: 50
   exit_after_profile: true
 
 parallel:
-  model_parallel_size: 8  # 8 个 stage (2 节点 × 4 GPU)
+  model_parallel_size: 8  # 16 个 stage (4 节点 × 4 GPU)
   data_parallel_size: 1
-  scheduler: naive        # Naive 调度器
+  scheduler: naive         # Naive 调度器
   use_orion_scheduler: false
+
