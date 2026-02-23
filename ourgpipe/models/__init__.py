@@ -6,5 +6,6 @@ GPipe 流水线框架模型实现
 
 # 导入所有模型以触发注册
 from . import gpt
+from . import llama
 
-__all__ = ['gpt']
+__all__ = ['gpt', 'llama']

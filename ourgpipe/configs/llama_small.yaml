@@ -1,0 +1,41 @@
+# LLaMA Small 配置 - 4 GPU Pipeline
+#
+# 结构: 1 em_tokn + 16 decoder + ln + lm_head = 19 层
+# 每 stage 约 4-5 层
+#
+# 使用标准 MHA (num_kv_heads == num_heads)
+# 如需 GQA，将 num_kv_heads 设为小于 num_heads 的值
+
+model:
+  name: llama
+  hidden_size: 512
+  num_layers: 16
+  num_heads: 8
+  sequence_length: 128
+  vocab_size: -1          # 从数据集获取
+  extra:
+    num_kv_heads: 8       # 等于 num_heads = 标准 MHA
+    intermediate_size: 1376  # ≈ 2/3 * 4 * 512, 取 32 的倍数
+    rms_norm_eps: 1.0e-5
+    rope_theta: 10000.0
+
+dataset:
+  name: code_search_net
+  batch_size: 64
+  num_workers: 0
+  extra: {}
+
+training:
+  learning_rate: 0.0001
+  epochs: 2
+  num_microbatches: 4
+  gradient_accumulation: 1
+  max_iterations: -1
+  profile_iteration: -1
+  exit_after_profile: false
+
+parallel:
+  model_parallel_size: 4
+  data_parallel_size: 1
+  scheduler: naive
+  use_orion_scheduler: false
