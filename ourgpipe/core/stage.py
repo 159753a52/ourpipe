@@ -4,7 +4,7 @@ GPipe 流水线框架抽象 Stage 基类
 提供流水线阶段的基础实现，包括：
 - 通信缓冲区管理
 - CUDA 流管理
-- 分布式通信
+- 分布式通信（同步/异步/P2P 批量）
 - Orion 调度器集成
 """
 
@@ -16,7 +16,7 @@ import threading
 import os
 import sys
 from abc import ABC, abstractmethod
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 
 from .config import PipelineConfig
 from .interfaces import StageInterface
@@ -580,6 +580,165 @@ class BaseStage(StageInterface, ABC):
         self.fwd_cache = [None] * self.num_microbatches
         self.input_cache = [None] * self.num_microbatches
         self.grad_buffers = [None] * self.num_microbatches
+    
+    # ==================== P2P 批量通信方法（用于 1F1B / ZeroBubble / Hanayo）====================
+    
+    def get_activation_shape(self) -> tuple:
+        """返回 activation tensor 的形状 (micro_batch_size, seq_len, hidden_size)"""
+        return (
+            self.micro_batch_size,
+            self.config.model.sequence_length,
+            self.config.model.hidden_size,
+        )
+    
+    def p2p_forward_send(self, tensor: torch.Tensor, mb_idx: int):
+        """构造前向 send P2P 操作 (发给 rank+1)
+        
+        Args:
+            tensor: 要发送的激活值
+            mb_idx: micro-batch 索引
+            
+        Returns:
+            (P2POp, send_buffer) 元组
+        """
+        from .comm import make_p2p_send
+        dst = self.global_rank + 1
+        return make_p2p_send(tensor, dst, tag=mb_idx,
+                             group=self.model_parallel_group)
+    
+    def p2p_forward_recv(self, mb_idx: int):
+        """构造前向 recv P2P 操作 (从 rank-1 接收)
+        
+        Args:
+            mb_idx: micro-batch 索引
+            
+        Returns:
+            (P2POp, recv_buffer) 元组
+        """
+        from .comm import make_p2p_recv
+        src = self.global_rank - 1
+        return make_p2p_recv(self.get_activation_shape(), src, tag=mb_idx,
+                             device=self.device,
+                             group=self.model_parallel_group)
+    
+    def p2p_backward_send(self, tensor: torch.Tensor, mb_idx: int):
+        """构造反向 send P2P 操作 (发给 rank-1)
+        
+        Args:
+            tensor: 要发送的梯度
+            mb_idx: micro-batch 索引
+            
+        Returns:
+            (P2POp, send_buffer) 元组
+        """
+        from .comm import make_p2p_send
+        dst = self.global_rank - 1
+        return make_p2p_send(tensor, dst, tag=1000 + mb_idx,
+                             group=self.model_parallel_group)
+    
+    def p2p_backward_recv(self, mb_idx: int):
+        """构造反向 recv P2P 操作 (从 rank+1 接收)
+        
+        Args:
+            mb_idx: micro-batch 索引
+            
+        Returns:
+            (P2POp, recv_buffer) 元组
+        """
+        from .comm import make_p2p_recv
+        src = self.global_rank + 1
+        return make_p2p_recv(self.get_activation_shape(), src, tag=1000 + mb_idx,
+                             device=self.device,
+                             group=self.model_parallel_group)
+    
+    # Hanayo Wave B 方向通信（方向反转）
+    
+    def p2p_forward_send_B(self, tensor: torch.Tensor, mb_idx: int):
+        """Wave B 前向 send (发给 rank-1)"""
+        from .comm import make_p2p_send
+        dst = self.global_rank - 1
+        return make_p2p_send(tensor, dst, tag=2000 + mb_idx,
+                             group=self.model_parallel_group)
+    
+    def p2p_forward_recv_B(self, mb_idx: int):
+        """Wave B 前向 recv (收)"""
+        from .comm import make_p2p_recv
+        src = self.global_rank + 1
+        return make_p2p_recv(self.get_activation_shape(), src, tag=2000 + mb_idx,
+                             device=self.device,
+                             group=self.model_parallel_group)
+    
+    def p2p_backward_send_B(self, tensor: torch.Tensor, mb_idx: int):
+        """Wave B 反向 send (发给 rank+1)"""
+        from .comm import make_p2p_send
+        dst = self.global_rank + 1
+        return make_p2p_send(tensor, dst, tag=3000 + mb_idx,
+                             group=self.model_parallel_group)
+    
+    def p2p_backward_recv_B(self, mb_idx: int):
+        """Wave B 反向 recv (从 rank-1 接收)"""
+        from .comm import make_p2p_recv
+        src = self.global_rank - 1
+        return make_p2p_recv(self.get_activation_shape(), src, tag=3000 + mb_idx,
+                             device=self.device,
+                             group=self.model_parallel_group)
+    
+    # ==================== 计算方法（用于 1F1B / ZeroBubble）====================
+    
+    def forward_compute(self, x: torch.Tensor, mb_idx: int) -> torch.Tensor:
+        """前向计算（不含通信），返回输出 tensor
+        
+        与 forward() 相同的逻辑，但命名更明确地表示不含通信。
+        
+        Args:
+            x: 输入张量
+            mb_idx: micro-batch 索引
+            
+        Returns:
+            输出张量
+        """
+        return self.forward(x, mb_idx)
+    
+    def backward_compute(
+        self,
+        mb_idx: int,
+        grad_or_label,
+        is_last_stage: bool = False
+    ) -> Tuple[Optional[float], Optional[torch.Tensor]]:
+        """反向计算（不含通信），返回 (loss_value, input_grad)
+        
+        Args:
+            mb_idx: micro-batch 索引
+            grad_or_label: 最后阶段传入 label，其他阶段传入梯度
+            is_last_stage: 是否为最后阶段
+            
+        Returns:
+            (loss_value, input_grad) 元组
+            - loss_value: 最后阶段返回 loss 数值，其他阶段返回 None
+            - input_grad: 非第一阶段返回输入梯度（用于发送给上一阶段），
+                          第一阶段返回 None
+        """
+        cached_output = self.fwd_cache[mb_idx]
+        
+        if is_last_stage:
+            # 最后阶段：计算 loss 并反向传播
+            loss = self.compute_loss(cached_output, grad_or_label)
+            loss.backward()
+            cached_input = self.input_cache[mb_idx]
+            input_grad = None
+            if cached_input is not None and cached_input.grad is not None:
+                input_grad = cached_input.grad
+            return loss.item(), input_grad
+        else:
+            # 非最后阶段：用接收到的梯度做反向传播
+            cached_output.backward(grad_or_label)
+            cached_input = self.input_cache[mb_idx]
+            input_grad = None
+            if (cached_input is not None
+                    and self.stage_id > 1
+                    and cached_input.grad is not None):
+                input_grad = cached_input.grad
+            return None, input_grad
     
     def stop_orion_scheduler(self):
         """停止 Orion 调度器并打印统计信息"""

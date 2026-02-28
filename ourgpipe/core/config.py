@@ -89,7 +89,7 @@ class ParallelConfig:
     """
     model_parallel_size: int = 4
     data_parallel_size: int = 1
-    scheduler: str = "async_threaded"  # 'naive' 或 'async_threaded'
+    scheduler: str = "async_threaded"  # 'naive' | 'async_threaded' | '1f1b' | 'hanayo' | 'zerobubble'
     use_orion_scheduler: bool = False
 
 
@@ -239,7 +239,7 @@ class PipelineConfig:
             raise ValueError("data_parallel_size must be positive")
         
         # 验证调度器类型
-        valid_schedulers = ['naive', 'async_threaded']
+        valid_schedulers = ['naive', 'async_threaded', '1f1b', 'hanayo', 'zerobubble']
         if self.parallel.scheduler not in valid_schedulers:
             raise ValueError(f"scheduler must be one of {valid_schedulers}, got '{self.parallel.scheduler}'")
         

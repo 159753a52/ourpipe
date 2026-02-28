@@ -8,8 +8,15 @@ from .interfaces import ModelInterface, StageInterface, DatasetInterface
 from .config import PipelineConfig, ModelConfig, DatasetConfig, TrainingConfig, ParallelConfig
 from .registry import MODEL_REGISTRY, DATASET_REGISTRY, STAGE_REGISTRY
 from .stage import BaseStage
-from .schedulers import BaseScheduler, SCHEDULER_REGISTRY, NaiveScheduler, AsyncThreadedScheduler
+from .schedulers import (
+    BaseScheduler, SCHEDULER_REGISTRY,
+    NaiveScheduler, AsyncThreadedScheduler,
+    OneFOneBScheduler, HanayoScheduler, ZeroBubbleScheduler,
+)
 from .metrics import MetricsTracker, collect_model_params, get_gpu_peak_flops
+from .comm import execute_p2p_ops, make_p2p_send, make_p2p_recv
+from .weight_grad_store import WeightGradStore
+from .bubble_linear import BubbleLinear, convert_to_bubble_model
 
 __all__ = [
     # 接口
@@ -33,6 +40,17 @@ __all__ = [
     # 调度器
     'NaiveScheduler',
     'AsyncThreadedScheduler',
+    'OneFOneBScheduler',
+    'HanayoScheduler',
+    'ZeroBubbleScheduler',
+    # P2P 通信
+    'execute_p2p_ops',
+    'make_p2p_send',
+    'make_p2p_recv',
+    # ZeroBubble 组件
+    'WeightGradStore',
+    'BubbleLinear',
+    'convert_to_bubble_model',
     # 指标追踪
     'MetricsTracker',
     'collect_model_params',

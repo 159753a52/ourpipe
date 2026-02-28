@@ -1,0 +1,36 @@
+# GPT Small 配置 - 使用 ZeroBubble 调度器
+# 单节点 4 GPU，适合调试
+# ZeroBubble 建议使用更多 microbatch 以充分利用 B/W 分离
+
+model:
+  name: gpt
+  hidden_size: 512
+  num_layers: 16
+  num_heads: 16
+  sequence_length: 128
+  vocab_size: -1
+  extra:
+    head_size: 32
+    ff_low_rank: null
+    dropout: 0.4
+
+dataset:
+  name: code_search_net
+  batch_size: 64
+  num_workers: 0
+  extra: {}
+
+training:
+  learning_rate: 0.0001
+  epochs: 2
+  num_microbatches: 8
+  gradient_accumulation: 1
+  max_iterations: -1
+  profile_iteration: 20
+  exit_after_profile: true
+
+parallel:
+  model_parallel_size: 4
+  data_parallel_size: 1
+  scheduler: zerobubble
+  use_orion_scheduler: false
