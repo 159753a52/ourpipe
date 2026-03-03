@@ -2,7 +2,8 @@
 # 单节点 4 GPU，适合调试
 # Hanayo 会将 batch 拆成 2*num_microbatches 份
 # 实际 micro_batch_size = batch_size / (num_microbatches * 2)
-
+# export HANAYO_DEBUG_TRACE=0 
+# export HANAYO_DEBUG_ITER=0
 model:
   name: gpt
   hidden_size: 512
@@ -17,7 +18,7 @@ model:
 
 dataset:
   name: code_search_net
-  batch_size: 64
+  batch_size: 32
   num_workers: 0
   extra: {}
 

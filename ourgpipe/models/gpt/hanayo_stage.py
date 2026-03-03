@@ -90,17 +90,13 @@ class GPTHanayoStage(BaseStage):
     ) -> nn.Module:
         """创建 Hanayo 双向子模型"""
         layer_names = list(model_config.keys())
-        print(f"[CREATE_MODEL] rank={self.global_rank} stage={self.stage_id} layer_indices={layer_indices}", flush=True)
 
         if self.stage_id == 1:
-            print(f"[CREATE_MODEL] Stage 1: Creating Wave A entry + Wave B exit", flush=True)
             # Wave A 入口：embedding
             tokn_name = layer_names[layer_indices[0]]
             pos_name = layer_names[layer_indices[1]]
-            print(f"[CREATE_MODEL] Creating token_embedding_A: {tokn_name}", flush=True)
             self.token_embedding_A = model_adapter.create_layer(
                 tokn_name, model_config[tokn_name])
-            print(f"[CREATE_MODEL] Creating position_embedding_A: {pos_name}", flush=True)
             self.position_embedding_A = model_adapter.create_layer(
                 pos_name, model_config[pos_name])
 
@@ -108,42 +104,34 @@ class GPTHanayoStage(BaseStage):
             decoder_layers = []
             for idx in layer_indices[2:]:
                 layer_name = layer_names[idx]
-                print(f"[CREATE_MODEL] Creating decoder layer: {layer_name}", flush=True)
                 layer = model_adapter.create_layer(
                     layer_name, model_config[layer_name])
                 decoder_layers.append(layer)
             decoder = nn.Sequential(*decoder_layers) if decoder_layers else nn.Identity()
-            print(f"[CREATE_MODEL] Created {len(decoder_layers)} decoder layers", flush=True)
 
             # Wave B 出口：ln + lm_head
             hidden_size = model_config[layer_names[0]][1]  # em_tokn 的第二个参数
             vocab_size = model_config[layer_names[0]][0]
-            print(f"[CREATE_MODEL] Creating ln_B and lm_head_B: hidden={hidden_size}, vocab={vocab_size}", flush=True)
             self.ln_B = nn.LayerNorm(hidden_size)
             self.lm_head_B = nn.Linear(hidden_size, vocab_size)
 
             return decoder
 
         elif self.stage_id == self.model_parallel_size:
-            print(f"[CREATE_MODEL] Stage {self.stage_id}: Creating Wave A exit + Wave B entry", flush=True)
             # 共享 decoder layers (不含最后两层 ln + lm_head)
             decoder_layers = []
             for idx in layer_indices[:-2]:
                 layer_name = layer_names[idx]
-                print(f"[CREATE_MODEL] Creating decoder layer: {layer_name}", flush=True)
                 layer = model_adapter.create_layer(
                     layer_name, model_config[layer_name])
                 decoder_layers.append(layer)
             decoder = nn.Sequential(*decoder_layers) if decoder_layers else nn.Identity()
-            print(f"[CREATE_MODEL] Created {len(decoder_layers)} decoder layers", flush=True)
 
             # Wave A 出口：ln + lm_head
             ln_name = layer_names[layer_indices[-2]]
             head_name = layer_names[layer_indices[-1]]
-            print(f"[CREATE_MODEL] Creating ln_A: {ln_name}", flush=True)
             self.ln_A = model_adapter.create_layer(
                 ln_name, model_config[ln_name])
-            print(f"[CREATE_MODEL] Creating lm_head_A: {head_name}", flush=True)
             self.lm_head_A = model_adapter.create_layer(
                 head_name, model_config[head_name])
 
@@ -151,23 +139,19 @@ class GPTHanayoStage(BaseStage):
             hidden_size = model_config[layer_names[0]][1]
             vocab_size = model_config[layer_names[0]][0]
             seq_len = model_config[layer_names[1]][0]
-            print(f"[CREATE_MODEL] Creating token_embedding_B and position_embedding_B: vocab={vocab_size}, hidden={hidden_size}, seq_len={seq_len}", flush=True)
             self.token_embedding_B = nn.Embedding(vocab_size, hidden_size)
             self.position_embedding_B = nn.Embedding(seq_len, hidden_size)
 
             return decoder
 
         else:
-            print(f"[CREATE_MODEL] Stage {self.stage_id}: Creating middle stage (decoder only)", flush=True)
             # 中间阶段：只有 decoder layers
             layers = []
             for idx in layer_indices:
                 layer_name = layer_names[idx]
-                print(f"[CREATE_MODEL] Creating decoder layer: {layer_name}", flush=True)
                 layer = model_adapter.create_layer(
                     layer_name, model_config[layer_name])
                 layers.append(layer)
-            print(f"[CREATE_MODEL] Created {len(layers)} decoder layers", flush=True)
             return nn.Sequential(*layers)
 
     def prepare_input(self, x: torch.Tensor, mb_idx: int) -> torch.Tensor:
@@ -241,41 +225,19 @@ class GPTHanayoStage(BaseStage):
 
     def _embed(self, x: torch.Tensor, wave: str) -> torch.Tensor:
         """对输入做 embedding"""
-        print(f"[EMBED_DEBUG] rank={self.global_rank} stage={self.stage_id} wave={wave} x.shape={x.shape}", flush=True)
         B, T = x.shape
         pos = torch.arange(0, T, dtype=torch.long, device=x.device)
         if wave == 'A':
-            print(f"[EMBED_DEBUG] Using token_embedding_A and position_embedding_A", flush=True)
-            tok_emb = self.token_embedding_A(x)
-            pos_emb = self.position_embedding_A(pos)
-            result = tok_emb + pos_emb
-            print(f"[EMBED_DEBUG] result.shape={result.shape}", flush=True)
-            return result
+            return self.token_embedding_A(x) + self.position_embedding_A(pos)
         else:
-            print(f"[EMBED_DEBUG] Using token_embedding_B and position_embedding_B", flush=True)
-            tok_emb = self.token_embedding_B(x)
-            pos_emb = self.position_embedding_B(pos)
-            result = tok_emb + pos_emb
-            print(f"[EMBED_DEBUG] result.shape={result.shape}", flush=True)
-            return result
+            return self.token_embedding_B(x) + self.position_embedding_B(pos)
 
     def _head(self, y: torch.Tensor, wave: str) -> torch.Tensor:
         """对输出做 ln + lm_head"""
-        print(f"[HEAD_DEBUG] rank={self.global_rank} stage={self.stage_id} wave={wave} y.shape={y.shape}", flush=True)
         if wave == 'A':
-            print(f"[HEAD_DEBUG] Using ln_A and lm_head_A", flush=True)
-            ln_out = self.ln_A(y)
-            print(f"[HEAD_DEBUG] After ln_A: ln_out.shape={ln_out.shape}", flush=True)
-            result = self.lm_head_A(ln_out)
-            print(f"[HEAD_DEBUG] After lm_head_A: result.shape={result.shape}", flush=True)
-            return result
+            return self.lm_head_A(self.ln_A(y))
         else:
-            print(f"[HEAD_DEBUG] Using ln_B and lm_head_B", flush=True)
-            ln_out = self.ln_B(y)
-            print(f"[HEAD_DEBUG] After ln_B: ln_out.shape={ln_out.shape}", flush=True)
-            result = self.lm_head_B(ln_out)
-            print(f"[HEAD_DEBUG] After lm_head_B: result.shape={result.shape}", flush=True)
-            return result
+            return self.lm_head_B(self.ln_B(y))
 
     def forward_wave(
         self,
@@ -295,43 +257,21 @@ class GPTHanayoStage(BaseStage):
         Returns:
             输出张量
         """
-        print(f"[FW_DEBUG] rank={self.global_rank} stage={self.stage_id} wave={wave} mb={mb_idx} "
-              f"entry={self.is_entry(wave)} exit={self.is_exit(wave)}", flush=True)
-        
         if self.is_entry(wave):
-            print(f"[FW_DEBUG] Entry path: micro_input.shape={micro_input.shape}", flush=True)
             x_emb = self._embed(micro_input, wave)
-            print(f"[FW_DEBUG] After embed: x_emb.shape={x_emb.shape}", flush=True)
             self.input_cache_wave[wave][mb_idx] = x_emb
-            print(f"[FW_DEBUG] Before sub_model", flush=True)
             y = self.sub_model(x_emb)
-            print(f"[FW_DEBUG] After sub_model: y.shape={y.shape}", flush=True)
         elif self.is_exit(wave):
-            print(f"[FW_DEBUG] Exit path: recv_buf.shape={recv_buf.shape}", flush=True)
             x = recv_buf.requires_grad_(True)
             self.input_cache_wave[wave][mb_idx] = x
-            print(f"[FW_DEBUG] Before sub_model", flush=True)
-            y_hidden = self.sub_model(x)
-            print(f"[FW_DEBUG] After sub_model: y_hidden.shape={y_hidden.shape}", flush=True)
-            print(f"[FW_DEBUG] Before head", flush=True)
-            y = self._head(y_hidden, wave)
-            print(f"[FW_DEBUG] After head: y.shape={y.shape}", flush=True)
+            y = self._head(self.sub_model(x), wave)
         else:
-            print(f"[FW_DEBUG] Middle path: recv_buf.shape={recv_buf.shape}", flush=True)
             x = recv_buf.requires_grad_(True)
             self.input_cache_wave[wave][mb_idx] = x
-            print(f"[FW_DEBUG] Before sub_model, x.device={x.device}, x.requires_grad={x.requires_grad}", flush=True)
-            print(f"[FW_DEBUG] sub_model type: {type(self.sub_model)}", flush=True)
-            print(f"[FW_DEBUG] sub_model device: {next(self.sub_model.parameters()).device if len(list(self.sub_model.parameters())) > 0 else 'no params'}", flush=True)
-            print(f"[FW_DEBUG] Calling sub_model...", flush=True)
             y = self.sub_model(x)
-            print(f"[FW_DEBUG] After sub_model: y.shape={y.shape}, y.device={y.device}", flush=True)
 
-        print(f"[FW_DEBUG] Before retain_grad", flush=True)
         y.retain_grad()
-        print(f"[FW_DEBUG] After retain_grad", flush=True)
         self.fwd_cache_wave[wave][mb_idx] = y
-        print(f"[FW_DEBUG] Done: returning y.shape={y.shape}", flush=True)
         return y
 
     def backward_wave(
