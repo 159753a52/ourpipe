@@ -58,17 +58,38 @@ def make_p2p_recv(
     return op, buf
 
 
-def execute_p2p_ops(ops: List[dist.P2POp]) -> None:
-    """批量提交 P2P 操作并等待完成
+def submit_p2p_ops(ops: List[dist.P2POp]):
+    """批量提交 P2P 操作，不等待完成
 
-    使用 batch_isend_irecv 一次性提交所有操作，
-    这是避免 NCCL 死锁的关键：send 和 recv 必须成对出现在同一个 batch 中。
+    适用于希望先发起通信、稍后再统一 wait 的场景（例如 Hanayo 中的 send）。
+
+    Args:
+        ops: P2P 操作列表
+
+    Returns:
+        通信请求句柄列表
+    """
+    if not ops:
+        return []
+    return dist.batch_isend_irecv(ops)
+
+
+
+def execute_p2p_ops(ops: List[dist.P2POp]) -> None:
+    """提交 P2P 操作并等待完成
+
+    逐个提交 P2P 操作（避免 batch_isend_irecv 在某些 NCCL 版本中的
+    group semantics 问题），然后等待所有操作完成。
 
     Args:
         ops: P2P 操作列表
     """
     if not ops:
         return
-    reqs = dist.batch_isend_irecv(ops)
+    reqs = []
+    for op in ops:
+        # 直接使用 isend/irecv 而非 batch_isend_irecv
+        req = op.op(op.tensor, op.peer, group=op.group, tag=op.tag)
+        reqs.append(req)
     for req in reqs:
         req.wait()

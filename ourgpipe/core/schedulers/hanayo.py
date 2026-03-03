@@ -16,6 +16,8 @@ Hanayo 双向流水线调度器
 """
 
 from typing import List, TYPE_CHECKING
+import os
+import time
 
 import torch
 from torch.profiler import record_function
@@ -82,6 +84,41 @@ def build_hanayo_schedule(pipeline_rank: int, num_stages: int, num_mb: int):
     return schedule
 
 
+def _hanayo_debug_enabled() -> bool:
+    """是否启用 Hanayo 调试追踪日志"""
+    return os.environ.get("HANAYO_DEBUG_TRACE", "0") == "1"
+
+
+
+def _hanayo_debug_iter() -> int:
+    """读取要追踪的 iteration（默认 0）"""
+    try:
+        return int(os.environ.get("HANAYO_DEBUG_ITER", "0"))
+    except ValueError:
+        return 0
+
+
+
+def _trace_hanayo(debug: bool, message: str) -> None:
+    """按需打印 Hanayo 追踪日志"""
+    if debug:
+        print(f"[HANAYO][{time.time():.6f}] {message}", flush=True)
+
+
+
+def _get_comm_meta(global_rank: int, action: str, mb_idx: int):
+    """返回 (recv_peer, send_peer, tag)"""
+    if action == 'fA':
+        return global_rank - 1, global_rank + 1, mb_idx
+    if action == 'fB':
+        return global_rank + 1, global_rank - 1, 2000 + mb_idx
+    if action == 'bA':
+        return global_rank + 1, global_rank - 1, 1000 + mb_idx
+    if action == 'bB':
+        return global_rank - 1, global_rank + 1, 3000 + mb_idx
+    raise ValueError(f"Unknown hanayo action: {action}")
+
+
 @SCHEDULER_REGISTRY.register("hanayo")
 class HanayoScheduler(BaseScheduler):
     """Hanayo 双向流水线调度器
@@ -127,14 +164,31 @@ class HanayoScheduler(BaseScheduler):
         schedule = build_hanayo_schedule(
             pipeline_rank, self.model_parallel_size, num_mb)
 
+        debug_this_iter = (
+            _hanayo_debug_enabled() and iteration == _hanayo_debug_iter())
+
+        _trace_hanayo(
+            debug_this_iter,
+            f"iter={iteration} rank={stage.global_rank} stage={stage.stage_id} "
+            f"pipeline_rank={pipeline_rank} schedule={schedule}"
+        )
+
         recv_bufs = {'fA': {}, 'fB': {}, 'bA': {}, 'bB': {}}
-        send_bufs = []
 
         for action, mb_idx in schedule:
             wave = action[1]  # 'A' or 'B'
             is_fwd = action[0] == 'f'
             is_entry = stage.is_entry(wave)
             is_exit = stage.is_exit(wave)
+            recv_peer, send_peer, tag = _get_comm_meta(
+                stage.global_rank, action, mb_idx)
+
+            _trace_hanayo(
+                debug_this_iter,
+                f"iter={iteration} rank={stage.global_rank} stage={stage.stage_id} "
+                f"action={action} mb={mb_idx} entry={is_entry} exit={is_exit} "
+                f"recv_peer={recv_peer} send_peer={send_peer} tag={tag}"
+            )
 
             if is_fwd:
                 # --- Forward ---
@@ -145,24 +199,62 @@ class HanayoScheduler(BaseScheduler):
                             op, buf = stage.p2p_forward_recv(mb_idx)
                         else:
                             op, buf = stage.p2p_forward_recv_B(mb_idx)
+                        _trace_hanayo(
+                            debug_this_iter,
+                            f"iter={iteration} rank={stage.global_rank} stage={stage.stage_id} "
+                            f"action={action} mb={mb_idx} RECV_START peer={recv_peer} "
+                            f"tag={tag} expected_shape={stage.get_activation_shape()}"
+                        )
                         execute_p2p_ops([op])
+                        _trace_hanayo(
+                            debug_this_iter,
+                            f"iter={iteration} rank={stage.global_rank} stage={stage.stage_id} "
+                            f"action={action} mb={mb_idx} RECV_DONE peer={recv_peer} "
+                            f"tag={tag} recv_shape={tuple(buf.shape)}"
+                        )
+                        if tuple(buf.shape) != stage.get_activation_shape():
+                            raise ValueError(
+                                "[P2P] forward_recv shape mismatch: "
+                                f"stage_id={stage.stage_id} rank={stage.global_rank} mb_idx={mb_idx} wave={wave} "
+                                f"recv_buf.shape={tuple(buf.shape)} expected={stage.get_activation_shape()}"
+                            )
                         recv_bufs[action][mb_idx] = buf
 
                     inputs = micro_inputs_A if wave == 'A' else micro_inputs_B
+                    _trace_hanayo(
+                        debug_this_iter,
+                        f"iter={iteration} rank={stage.global_rank} stage={stage.stage_id} "
+                        f"action={action} mb={mb_idx} FORWARD_START entry={is_entry}"
+                    )
                     if is_entry:
                         y = stage.forward_wave(wave, mb_idx,
                                                micro_input=inputs[mb_idx])
                     else:
                         y = stage.forward_wave(wave, mb_idx,
                                        recv_buf=recv_bufs[action].pop(mb_idx))
+                    _trace_hanayo(
+                        debug_this_iter,
+                        f"iter={iteration} rank={stage.global_rank} stage={stage.stage_id} "
+                        f"action={action} mb={mb_idx} FORWARD_DONE output_shape={tuple(y.shape)}"
+                    )
 
                     if not is_exit:
                         if wave == 'A':
                             op, sbuf = stage.p2p_forward_send(y, mb_idx)
                         else:
                             op, sbuf = stage.p2p_forward_send_B(y, mb_idx)
-                        send_bufs.append(sbuf)
+                        _trace_hanayo(
+                            debug_this_iter,
+                            f"iter={iteration} rank={stage.global_rank} stage={stage.stage_id} "
+                            f"action={action} mb={mb_idx} SEND_START peer={send_peer} "
+                            f"tag={tag} send_shape={tuple(sbuf.shape)}"
+                        )
                         execute_p2p_ops([op])
+                        _trace_hanayo(
+                            debug_this_iter,
+                            f"iter={iteration} rank={stage.global_rank} stage={stage.stage_id} "
+                            f"action={action} mb={mb_idx} SEND_DONE peer={send_peer}"
+                        )
             else:
                 # --- Backward ---
                 with record_function(f"{action}_{mb_idx}"):
@@ -172,7 +264,25 @@ class HanayoScheduler(BaseScheduler):
                         else:
                             op, rbuf = stage.p2p_backward_recv_B(mb_idx)
                         recv_bufs[action][mb_idx] = rbuf
+                        _trace_hanayo(
+                            debug_this_iter,
+                            f"iter={iteration} rank={stage.global_rank} stage={stage.stage_id} "
+                            f"action={action} mb={mb_idx} RECV_START peer={recv_peer} "
+                            f"tag={tag} expected_shape={stage.get_activation_shape()}"
+                        )
                         execute_p2p_ops([op])
+                        _trace_hanayo(
+                            debug_this_iter,
+                            f"iter={iteration} rank={stage.global_rank} stage={stage.stage_id} "
+                            f"action={action} mb={mb_idx} RECV_DONE peer={recv_peer} "
+                            f"tag={tag} recv_shape={tuple(rbuf.shape)}"
+                        )
+                        if tuple(rbuf.shape) != stage.get_activation_shape():
+                            raise ValueError(
+                                "[P2P] backward_recv shape mismatch: "
+                                f"stage_id={stage.stage_id} rank={stage.global_rank} mb_idx={mb_idx} wave={wave} "
+                                f"recv_buf.shape={tuple(rbuf.shape)} expected={stage.get_activation_shape()}"
+                            )
 
                     labels = micro_labels_A if wave == 'A' else micro_labels_B
                     if is_exit:
@@ -188,8 +298,18 @@ class HanayoScheduler(BaseScheduler):
                             op, sbuf = stage.p2p_backward_send(input_grad, mb_idx)
                         else:
                             op, sbuf = stage.p2p_backward_send_B(input_grad, mb_idx)
-                        send_bufs.append(sbuf)
+                        _trace_hanayo(
+                            debug_this_iter,
+                            f"iter={iteration} rank={stage.global_rank} stage={stage.stage_id} "
+                            f"action={action} mb={mb_idx} SEND_START peer={send_peer} "
+                            f"tag={tag} send_shape={tuple(sbuf.shape)}"
+                        )
                         execute_p2p_ops([op])
+                        _trace_hanayo(
+                            debug_this_iter,
+                            f"iter={iteration} rank={stage.global_rank} stage={stage.stage_id} "
+                            f"action={action} mb={mb_idx} SEND_DONE peer={send_peer}"
+                        )
 
         # ======= Update =======
         self.run_update(stage)

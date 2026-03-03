@@ -65,6 +65,8 @@ def get_device():
     """获取当前进程应该使用的设备"""
     local_rank = int(os.getenv('LOCAL_RANK', 0))
     if torch.cuda.is_available():
+        # 显式绑定当前进程到对应 GPU，避免 NCCL/allocator 选择错误设备导致的卡顿/异常
+        torch.cuda.set_device(local_rank)
         return f'cuda:{local_rank}'
     return 'cpu'
 
@@ -213,11 +215,13 @@ def main():
         shuffle=True
     ) if data_parallel_size > 1 else None
     
+    # Hanayo 依赖固定 micro-batch 形状，尾批次不足会破坏通信 shape 假设
     train_loader = DataLoader(
         dataset=train_data,
         batch_size=config.dataset.batch_size,
         sampler=train_sampler,
-        num_workers=config.dataset.num_workers
+        num_workers=config.dataset.num_workers,
+        drop_last=(config.parallel.scheduler == 'hanayo')
     )
     
     if global_rank == 0:

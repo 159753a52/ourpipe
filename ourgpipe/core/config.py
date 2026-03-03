@@ -229,7 +229,12 @@ class PipelineConfig:
             raise ValueError("learning_rate must be positive")
         if self.training.num_microbatches <= 0:
             raise ValueError("num_microbatches must be positive")
-        if self.dataset.batch_size % self.training.num_microbatches != 0:
+
+        # Hanayo 会把一个 batch 拆成 2*num_microbatches 份，必须保证每份大小一致
+        effective_microbatches = self.training.num_microbatches * (2 if self.parallel.scheduler == 'hanayo' else 1)
+        if self.dataset.batch_size % effective_microbatches != 0:
+            if self.parallel.scheduler == 'hanayo':
+                raise ValueError("batch_size must be divisible by 2*num_microbatches for hanayo scheduler")
             raise ValueError("batch_size must be divisible by num_microbatches")
         
         # 验证并行配置

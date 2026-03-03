@@ -14,6 +14,20 @@ import gc
 from GPT import *
 import contextlib
 
+"""
+    cd orion-docker/ourgpipe
+    source /home/bingxing2/home/scx9kvs/mxy/env.sh
+    conda activate pai-megatron
+
+torchrun \
+    --nnodes=1 \
+    --node_rank=0 \
+    --nproc_per_node=4 \
+    --master_addr="127.0.0.1" \
+    --master_port=1231 \
+    hanayo_naive.py
+"""
+
 # ================= Configuration =================
 emb_size = 512
 head_size = 32

@@ -96,7 +96,10 @@ class BaseStage(StageInterface, ABC):
         
         # 计算 micro-batch 大小
         self.num_microbatches = config.training.num_microbatches
-        self.micro_batch_size = config.dataset.batch_size // self.num_microbatches
+        
+        # Hanayo 会把一个 batch 拆成 2*num_microbatches 份（Wave A/B 各 num_microbatches）
+        effective_microbatches = self.num_microbatches * (2 if config.parallel.scheduler == 'hanayo' else 1)
+        self.micro_batch_size = config.dataset.batch_size // effective_microbatches
         
         # 创建子模型（由子类实现，按需创建层）
         self.sub_model = self.create_sub_model(model_adapter, model_config, layer_indices)
@@ -601,6 +604,16 @@ class BaseStage(StageInterface, ABC):
         Returns:
             (P2POp, send_buffer) 元组
         """
+        expected_shape = self.get_activation_shape()
+        if tuple(tensor.shape) != expected_shape:
+            raise ValueError(
+                "[P2P] forward_send shape mismatch: "
+                f"stage_id={self.stage_id} rank={self.global_rank} mb_idx={mb_idx} "
+                f"tensor.shape={tuple(tensor.shape)} expected={expected_shape} "
+                f"(scheduler={self.config.parallel.scheduler}, "
+                f"batch={self.config.dataset.batch_size}, microbatches={self.num_microbatches})"
+            )
+
         from .comm import make_p2p_send
         dst = self.global_rank + 1
         return make_p2p_send(tensor, dst, tag=mb_idx,
@@ -631,6 +644,16 @@ class BaseStage(StageInterface, ABC):
         Returns:
             (P2POp, send_buffer) 元组
         """
+        expected_shape = self.get_activation_shape()
+        if tuple(tensor.shape) != expected_shape:
+            raise ValueError(
+                "[P2P] backward_send shape mismatch: "
+                f"stage_id={self.stage_id} rank={self.global_rank} mb_idx={mb_idx} "
+                f"tensor.shape={tuple(tensor.shape)} expected={expected_shape} "
+                f"(scheduler={self.config.parallel.scheduler}, "
+                f"batch={self.config.dataset.batch_size}, microbatches={self.num_microbatches})"
+            )
+
         from .comm import make_p2p_send
         dst = self.global_rank - 1
         return make_p2p_send(tensor, dst, tag=1000 + mb_idx,
@@ -655,6 +678,16 @@ class BaseStage(StageInterface, ABC):
     
     def p2p_forward_send_B(self, tensor: torch.Tensor, mb_idx: int):
         """Wave B 前向 send (发给 rank-1)"""
+        expected_shape = self.get_activation_shape()
+        if tuple(tensor.shape) != expected_shape:
+            raise ValueError(
+                "[P2P] forward_send_B shape mismatch: "
+                f"stage_id={self.stage_id} rank={self.global_rank} mb_idx={mb_idx} "
+                f"tensor.shape={tuple(tensor.shape)} expected={expected_shape} "
+                f"(scheduler={self.config.parallel.scheduler}, "
+                f"batch={self.config.dataset.batch_size}, microbatches={self.num_microbatches})"
+            )
+
         from .comm import make_p2p_send
         dst = self.global_rank - 1
         return make_p2p_send(tensor, dst, tag=2000 + mb_idx,
@@ -670,6 +703,16 @@ class BaseStage(StageInterface, ABC):
     
     def p2p_backward_send_B(self, tensor: torch.Tensor, mb_idx: int):
         """Wave B 反向 send (发给 rank+1)"""
+        expected_shape = self.get_activation_shape()
+        if tuple(tensor.shape) != expected_shape:
+            raise ValueError(
+                "[P2P] backward_send_B shape mismatch: "
+                f"stage_id={self.stage_id} rank={self.global_rank} mb_idx={mb_idx} "
+                f"tensor.shape={tuple(tensor.shape)} expected={expected_shape} "
+                f"(scheduler={self.config.parallel.scheduler}, "
+                f"batch={self.config.dataset.batch_size}, microbatches={self.num_microbatches})"
+            )
+
         from .comm import make_p2p_send
         dst = self.global_rank + 1
         return make_p2p_send(tensor, dst, tag=3000 + mb_idx,
