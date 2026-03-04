@@ -37,7 +37,7 @@ learning_rate = 1e-4
 eval_iters = 20
 batch_size = 32
 epochs = 2
-num_microbatches = 4
+num_microbatches = 8
 
 def init_model(model_config):
     model = nn.ModuleList()

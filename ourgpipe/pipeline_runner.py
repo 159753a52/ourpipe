@@ -1,15 +1,6 @@
 #!/usr/bin/env python3
 """
-Pipeline 流水线并行训练 - 模型无关的主入口
 
-支持的调度策略:
-- naive:          GPipe 同步阻塞调度
-- async_threaded: GPipe 异步多线程调度
-- 1f1b:           One Forward One Backward
-- zerobubble:     ZeroBubble (ZB-H1, B/W 分离)
-- hanayo:         Hanayo 双向流水线
-
-使用方法:
     cd orion-docker/ourgpipe
     source /home/bingxing2/home/scx9kvs/mxy/env.sh
     conda activate pai-megatron
@@ -65,6 +56,13 @@ def get_device():
     """获取当前进程应该使用的设备"""
     local_rank = int(os.getenv('LOCAL_RANK', 0))
     if torch.cuda.is_available():
+        gpu_count = torch.cuda.device_count()
+        if local_rank >= gpu_count:
+            raise RuntimeError(
+                f"LOCAL_RANK={local_rank} but only {gpu_count} GPUs visible. "
+                f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'not set')}. "
+                f"Check SLURM --gres=gpu setting and node GPU availability."
+            )
         # 显式绑定当前进程到对应 GPU，避免 NCCL/allocator 选择错误设备导致的卡顿/异常
         torch.cuda.set_device(local_rank)
         return f'cuda:{local_rank}'
@@ -78,7 +76,7 @@ def setup_distributed():
         for key in ("MASTER_ADDR", "MASTER_PORT", "WORLD_SIZE", "LOCAL_WORLD_SIZE")
     }
     
-    dist.init_process_group(backend="NCCL", timeout=datetime.timedelta(seconds=300))
+    dist.init_process_group(backend="nccl", timeout=datetime.timedelta(seconds=1800))
     
     global_rank = int(os.environ["RANK"])
     if global_rank == 0:
@@ -356,7 +354,7 @@ def main():
                 current_throughput = metrics_tracker.get_throughput()
                 print(f"\n################## iteration {i} | throughput: {current_throughput:,.0f} tokens/s ##################", flush=True)
             
-            dist.barrier()
+            dist.barrier(group=model_parallel_group)
             
             with profiler_context:
                 # 使用调度器执行训练迭代
@@ -368,7 +366,7 @@ def main():
                     current_stage=current_stage
                 )
             
-            dist.barrier()
+            dist.barrier(group=model_parallel_group)
             torch.cuda.synchronize()
             
             # 记录迭代完成
@@ -390,7 +388,7 @@ def main():
                         flops_per_token=flops_per_token
                     )
                 my_stage.stop_orion_scheduler()
-                dist.barrier()
+                dist.barrier(group=model_parallel_group)
                 dist.destroy_process_group()
                 sys.exit(0)
     
@@ -406,7 +404,7 @@ def main():
     
     # 清理
     my_stage.stop_orion_scheduler()
-    dist.barrier()
+    dist.barrier(group=model_parallel_group)
     dist.destroy_process_group()
 
 

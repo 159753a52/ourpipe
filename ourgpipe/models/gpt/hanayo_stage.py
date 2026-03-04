@@ -52,6 +52,12 @@ class GPTHanayoStage(BaseStage):
         # Wave 缓存（dict of dict）
         self.fwd_cache_wave = {'A': {}, 'B': {}}
         self.input_cache_wave = {'A': {}, 'B': {}}
+        
+        # 保存 model_parallel_size，因为 create_sub_model 需要用到
+        self.model_parallel_size = model_parallel_size
+        
+        # 延迟优化器初始化，因为 Hanayo 需要在创建额外层后再创建优化器
+        self._defer_optimizer_init = True
 
         super().__init__(
             stage_id=stage_id,
@@ -80,6 +86,16 @@ class GPTHanayoStage(BaseStage):
             all_params += list(self.lm_head_A.parameters())
             all_params += list(self.token_embedding_B.parameters())
             all_params += list(self.position_embedding_B.parameters())
+        
+        # 确保参数列表不为空
+        if len(all_params) == 0:
+            raise ValueError(
+                f"Stage {self.stage_id}: No parameters found for optimizer. "
+                f"layer_indices={layer_indices}, "
+                f"sub_model has {sum(1 for _ in self.sub_model.parameters())} params, "
+                f"is_first={self.stage_id == 1}, is_last={self.stage_id == self.model_parallel_size}"
+            )
+        
         self.optimizer = optim.Adam(all_params, lr=config.training.learning_rate)
 
     def create_sub_model(
@@ -118,6 +134,13 @@ class GPTHanayoStage(BaseStage):
             return decoder
 
         elif self.stage_id == self.model_parallel_size:
+            # 检查是否有足够的层
+            if len(layer_indices) < 2:
+                raise ValueError(
+                    f"Stage {self.stage_id} (last stage) needs at least 2 layers (ln + lm_head), "
+                    f"but got layer_indices={layer_indices}"
+                )
+            
             # 共享 decoder layers (不含最后两层 ln + lm_head)
             decoder_layers = []
             for idx in layer_indices[:-2]:

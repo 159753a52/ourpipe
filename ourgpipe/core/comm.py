@@ -78,18 +78,14 @@ def submit_p2p_ops(ops: List[dist.P2POp]):
 def execute_p2p_ops(ops: List[dist.P2POp]) -> None:
     """提交 P2P 操作并等待完成
 
-    逐个提交 P2P 操作（避免 batch_isend_irecv 在某些 NCCL 版本中的
-    group semantics 问题），然后等待所有操作完成。
+    使用 batch_isend_irecv 批量提交 P2P 操作，保证 send/recv 配对
+    在 NCCL 中原子性进入，避免跨节点 P2P 死锁。
 
     Args:
         ops: P2P 操作列表
     """
     if not ops:
         return
-    reqs = []
-    for op in ops:
-        # 直接使用 isend/irecv 而非 batch_isend_irecv
-        req = op.op(op.tensor, op.peer, group=op.group, tag=op.tag)
-        reqs.append(req)
+    reqs = dist.batch_isend_irecv(ops)
     for req in reqs:
         req.wait()

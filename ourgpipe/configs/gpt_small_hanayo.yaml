@@ -25,7 +25,7 @@ dataset:
 training:
   learning_rate: 0.0001
   epochs: 2
-  num_microbatches: 4
+  num_microbatches: 8
   gradient_accumulation: 1
   max_iterations: -1
   profile_iteration: 20

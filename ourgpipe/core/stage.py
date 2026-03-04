@@ -104,11 +104,12 @@ class BaseStage(StageInterface, ABC):
         # 创建子模型（由子类实现，按需创建层）
         self.sub_model = self.create_sub_model(model_adapter, model_config, layer_indices)
         
-        # 优化器
-        self.optimizer = optim.Adam(
-            self.sub_model.parameters(),
-            lr=config.training.learning_rate
-        )
+        # 优化器（子类可以通过设置 _defer_optimizer_init 来延迟初始化）
+        if not getattr(self, '_defer_optimizer_init', False):
+            self.optimizer = optim.Adam(
+                self.sub_model.parameters(),
+                lr=config.training.learning_rate
+            )
         
         # 初始化缓冲区和流
         self._init_buffers()
@@ -395,7 +396,7 @@ class BaseStage(StageInterface, ABC):
         dst = self.global_rank + 1
         direction = 0  # 前向传播方向
         tag = self._compute_tag(iter_num, self.stage_id, direction, mb_idx)
-        return dist.isend(tensor=out, dst=dst, tag=tag, group=self.model_parallel_group)
+        return dist.isend(tensor=out, dst=dst, tag=tag, group=None)
     
     def forward_irecv(self, mb_idx: int, iter_num: int):
         """异步接收上一阶段的前向传播输出
@@ -412,7 +413,7 @@ class BaseStage(StageInterface, ABC):
         direction = 0  # 前向传播方向
         tag = self._compute_tag(iter_num, sender_stage_id, direction, mb_idx)
         tensor_to_recv = self.out_x_buffers[mb_idx]
-        return dist.irecv(tensor=tensor_to_recv, src=src, tag=tag, group=self.model_parallel_group)
+        return dist.irecv(tensor=tensor_to_recv, src=src, tag=tag, group=None)
     
     def backward_isend(self, mb_idx: int, iter_num: int):
         """异步发送反向传播的梯度到上一阶段
@@ -429,7 +430,7 @@ class BaseStage(StageInterface, ABC):
         dst = self.global_rank - 1
         direction = 1  # 反向传播方向
         tag = self._compute_tag(iter_num, self.stage_id, direction, mb_idx)
-        return dist.isend(grad, dst=dst, tag=tag, group=self.model_parallel_group)
+        return dist.isend(grad, dst=dst, tag=tag, group=None)
     
     def backward_irecv(self, mb_idx: int, iter_num: int):
         """异步接收下一阶段的反向传播梯度
@@ -446,7 +447,7 @@ class BaseStage(StageInterface, ABC):
         direction = 1  # 反向传播方向
         tag = self._compute_tag(iter_num, sender_stage_id, direction, mb_idx)
         tensor_to_recv = self.grad_y_buffers[mb_idx]
-        return dist.irecv(tensor_to_recv, src=src, tag=tag, group=self.model_parallel_group)
+        return dist.irecv(tensor_to_recv, src=src, tag=tag, group=None)
     
     def _compute_tag(
         self,
@@ -486,7 +487,7 @@ class BaseStage(StageInterface, ABC):
             out: 要发送的输出张量
         """
         dst = self.global_rank + 1
-        dist.send(tensor=out, dst=dst, tag=self.stage_id, group=self.model_parallel_group)
+        dist.send(tensor=out, dst=dst, tag=self.stage_id, group=None)
     
     def forward_recv(self, mb_idx: int) -> None:
         """同步接收上一阶段的前向传播输出
@@ -499,7 +500,7 @@ class BaseStage(StageInterface, ABC):
         """
         src = self.global_rank - 1
         tensor_to_recv = self.out_x_buffers[mb_idx]
-        dist.recv(tensor=tensor_to_recv, src=src, tag=self.stage_id - 1, group=self.model_parallel_group)
+        dist.recv(tensor=tensor_to_recv, src=src, tag=self.stage_id - 1, group=None)
         self.out_x_buffers[mb_idx] = tensor_to_recv.to(self.device)
     
     def backward_send(self, mb_idx: int) -> None:
@@ -513,7 +514,7 @@ class BaseStage(StageInterface, ABC):
         cached_input = self.input_cache[mb_idx]
         grad = cached_input.grad  # dL/dX
         dst = self.global_rank - 1
-        dist.send(grad, dst=dst, group=self.model_parallel_group)
+        dist.send(grad, dst=dst, group=None)
     
     def backward_recv(self, mb_idx: int) -> None:
         """同步接收下一阶段的反向传播梯度
@@ -526,7 +527,7 @@ class BaseStage(StageInterface, ABC):
         """
         src = self.global_rank + 1
         tensor_to_recv = self.grad_y_buffers[mb_idx]
-        dist.recv(tensor_to_recv, src=src, group=self.model_parallel_group)
+        dist.recv(tensor_to_recv, src=src, group=None)
         self.grad_y_buffers[mb_idx] = tensor_to_recv.to(self.device)
     
     def all_reduce_gradients(self):
@@ -617,7 +618,7 @@ class BaseStage(StageInterface, ABC):
         from .comm import make_p2p_send
         dst = self.global_rank + 1
         return make_p2p_send(tensor, dst, tag=mb_idx,
-                             group=self.model_parallel_group)
+                             group=None)
     
     def p2p_forward_recv(self, mb_idx: int):
         """构造前向 recv P2P 操作 (从 rank-1 接收)
@@ -632,7 +633,7 @@ class BaseStage(StageInterface, ABC):
         src = self.global_rank - 1
         return make_p2p_recv(self.get_activation_shape(), src, tag=mb_idx,
                              device=self.device,
-                             group=self.model_parallel_group)
+                             group=None)
     
     def p2p_backward_send(self, tensor: torch.Tensor, mb_idx: int):
         """构造反向 send P2P 操作 (发给 rank-1)
@@ -657,7 +658,7 @@ class BaseStage(StageInterface, ABC):
         from .comm import make_p2p_send
         dst = self.global_rank - 1
         return make_p2p_send(tensor, dst, tag=1000 + mb_idx,
-                             group=self.model_parallel_group)
+                             group=None)
     
     def p2p_backward_recv(self, mb_idx: int):
         """构造反向 recv P2P 操作 (从 rank+1 接收)
@@ -672,7 +673,7 @@ class BaseStage(StageInterface, ABC):
         src = self.global_rank + 1
         return make_p2p_recv(self.get_activation_shape(), src, tag=1000 + mb_idx,
                              device=self.device,
-                             group=self.model_parallel_group)
+                             group=None)
     
     # Hanayo Wave B 方向通信（方向反转）
     
@@ -691,7 +692,7 @@ class BaseStage(StageInterface, ABC):
         from .comm import make_p2p_send
         dst = self.global_rank - 1
         return make_p2p_send(tensor, dst, tag=2000 + mb_idx,
-                             group=self.model_parallel_group)
+                             group=None)
     
     def p2p_forward_recv_B(self, mb_idx: int):
         """Wave B 前向 recv (收)"""
@@ -699,7 +700,7 @@ class BaseStage(StageInterface, ABC):
         src = self.global_rank + 1
         return make_p2p_recv(self.get_activation_shape(), src, tag=2000 + mb_idx,
                              device=self.device,
-                             group=self.model_parallel_group)
+                             group=None)
     
     def p2p_backward_send_B(self, tensor: torch.Tensor, mb_idx: int):
         """Wave B 反向 send (发给 rank+1)"""
@@ -716,7 +717,7 @@ class BaseStage(StageInterface, ABC):
         from .comm import make_p2p_send
         dst = self.global_rank + 1
         return make_p2p_send(tensor, dst, tag=3000 + mb_idx,
-                             group=self.model_parallel_group)
+                             group=None)
     
     def p2p_backward_recv_B(self, mb_idx: int):
         """Wave B 反向 recv (从 rank-1 接收)"""
@@ -724,7 +725,7 @@ class BaseStage(StageInterface, ABC):
         src = self.global_rank - 1
         return make_p2p_recv(self.get_activation_shape(), src, tag=3000 + mb_idx,
                              device=self.device,
-                             group=self.model_parallel_group)
+                             group=None)
     
     # ==================== 计算方法（用于 1F1B / ZeroBubble）====================
     

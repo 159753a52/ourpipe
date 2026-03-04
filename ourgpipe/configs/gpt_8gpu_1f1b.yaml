@@ -1,0 +1,43 @@
+# GPT 8-GPU (2节点) - 1F1B 调度器
+#
+# 架构: 2 节点 × 4 GPU = 8 个 stage
+# 调度器: 1F1B (One Forward One Backward)
+#
+# 层分配: 16 decoder + 2 embedding + ln + lm_head = 20 层
+#   8 stages → 每 stage 约 2-3 层
+#
+# 使用方法:
+#   sbatch submit_2nodes_all.sh configs/gpt_8gpu_1f1b.yaml
+
+model:
+  name: gpt
+  hidden_size: 512
+  num_layers: 16
+  num_heads: 16
+  sequence_length: 128
+  vocab_size: -1
+  extra:
+    head_size: 32
+    ff_low_rank: null
+    dropout: 0.1
+
+dataset:
+  name: code_search_net
+  batch_size: 64
+  num_workers: 0
+  extra: {}
+
+training:
+  learning_rate: 0.0001
+  epochs: 2
+  num_microbatches: 8     # 1F1B 建议 num_microbatches >= num_stages
+  gradient_accumulation: 1
+  max_iterations: -1
+  profile_iteration: 20
+  exit_after_profile: true
+
+parallel:
+  model_parallel_size: 8  # 8 个 stage (2节点 × 4 GPU)
+  data_parallel_size: 1
+  scheduler: 1f1b
+  use_orion_scheduler: false
